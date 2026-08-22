@@ -19,6 +19,7 @@
 #include "infra/seccomp_cache.h"
 #include "supercall/supercall.h"
 #include "hook/tp_marker.h"
+#include "selinux/selinux.h"
 #include "feature/kernel_umount.h"
 
 int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
@@ -46,7 +47,10 @@ int ksu_handle_setresuid(uid_t old_uid, uid_t new_uid)
         }
         ksu_set_task_tracepoint_flag(current);
     } else {
-        ksu_clear_task_tracepoint_flag_if_needed(current);
+        if (is_zygote(current_cred()))
+            ksu_set_task_tracepoint_flag(current);
+        else
+            ksu_clear_task_tracepoint_flag_if_needed(current);
     }
 
     // Handle kernel umount
