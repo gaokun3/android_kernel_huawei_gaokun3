@@ -1,1133 +1,1517 @@
 // SPDX-License-Identifier: GPL-2.0
-/*
- * Himax HX83121A touch algorithm implementation.
- *
- * This file contains the pure signal-processing pipeline:
- *   Phase 1: preprocessing  (baseline subtraction, CMF, IIR)
- *   Phase 2: touch solving  (macro-zone BFS, palm rejection, peak detection)
- *   Phase 3: tracking       (greedy distance-matching)
- *
- * No SPI, no IRQ, no input_dev — all driver glue lives in himax-spi-core.c.
- */
+/* Himax HX83121A algorithm state and wake handling. */
 
+#ifdef HX_ALGO_HOST_TEST
+#include "../tests/host-compat.h"
+#else
 #include <linux/kernel.h>
 #include <linux/limits.h>
 #include <linux/math64.h>
 #include <linux/string.h>
+#endif
 
-#include "hx-algo.h"
+#include "hx-algo-internal.h"
 
-/* Raw baseline value output by the firmware when no touch is present. */
-#define HX_BASELINE  0x7ffe
-
-/*
- * Default tracking constants — exposed through hx_algo fields so they can
- * be overridden at runtime via sysfs without reloading the module.
- */
 #define HIMAX_TRACK_MATCH_DIST2   (420 * 420)
-#define HIMAX_TRACK_LOST_FRAMES   3
-#define HIMAX_NEW_TOUCH_DEBOUNCE  2
+#define HIMAX_TRACK_LOST_FRAMES   4
+#define HIMAX_NEW_TOUCH_DEBOUNCE  1
+#define HIMAX_WAKE_TOUCH_MASK_RADIUS 2
+#define HIMAX_WAKE_MAX_TOUCH_CELLS   (HX_PIXELS / 3)
 
-/* ======================================================================== */
-/* Initialisation                                                            */
-/* ======================================================================== */
+/* Exported TSACore globals from the Gaokun Windows build.  The first seven
+ * entries are the common reset reasons; the remaining entries cover the
+ * less frequent side/special reasons.  Keep these as data, rather than
+ * scattering magic values through the policy implementation.
+ */
+static const u16 hx_safe_reset_time_default[10] = {
+	500, 500, 500, 500, 500, 500, 500, 500, 2000, 500,
+};
+static const u8 hx_safe_reset_push_default[10] = {
+	1, 1, 1, 1, 1, 1, 1, 0, 0, 0,
+};
+static const u8 hx_safe_reset_trigger_default[10] = {
+	5, 5, 5, 5, 5, 5, 50, 5, 5, 5,
+};
+static const u32 hx_safe_reset_screen_on_default[10] = {
+	300000, 300000, 300000, 300000, 300000,
+	300000, 300000, 600000, 600000, 600000,
+};
 
 void hx_algo_init_defaults(struct hx_algo *algo)
 {
+	/* Values track the current Windows solver defaults.  The baseline is
+	 * adaptive per cell; using one immutable 0x7ffe value was a major source
+	 * of weak-frame loss after temperature/VCOM/common-mode drift.
+	 */
+	algo->baseline_enabled              = true;
+	/* The Gaokun path normally runs at 120 Hz (about 8 ms/frame). */
+	algo->frame_interval_ms              = 8;
+	algo->safe_baseline_replace_enabled = false;
+	/* Gaokun g_tsaPrmtFlash + 0x5fc, used by BLIIR_Reset in raw-unified
+	 * mode.  Ordinary reset still copies the pre-CMF raw snapshot.
+	 */
+	algo->baseline_initial              = 0x7fff;
+	algo->blrecal_raw_center             = 0x8000;
+	algo->blrecal_raw_span               = 8000;
+	algo->blrecal_signal_threshold       = 600;
+	algo->baseline_noise_deadband       = 90;
+	algo->baseline_positive_deadband    = 14;
+	algo->baseline_negative_deadband    = 13;
+	algo->baseline_peak_threshold       = 305;
+	algo->baseline_release_hold_frames  = 60;
+	algo->baseline_positive_alpha_shift = 7;
+	algo->baseline_negative_alpha_shift = 5;
+	algo->baseline_noise_alpha_shift    = 6;
+	algo->baseline_positive_max_step    = 20;
+	algo->baseline_negative_max_step    = 20;
+	/* Windows BLIIR moves by a bounded step only after the whole frame is
+	 * eligible.  Keep common-mode recovery responsive, but make spatial
+	 * learning deliberately slow once that global gate has passed.
+	 */
+	algo->baseline_background_alpha_shift = 0;
+	algo->baseline_no_finger_alpha_shift = 6;
+	algo->baseline_recovery_alpha_shift = 2;
+	algo->baseline_background_max_step = 17;
+	algo->baseline_no_finger_max_step = 1;
+	algo->baseline_recovery_max_step = 256;
+	algo->baseline_recovery_max_frames = 30;
+	algo->baseline_noise_tracking = true;
+	algo->wake_stable_frames = 6;
+	algo->wake_finger_safe_frames = 3;
+	algo->wake_raw_jump_threshold = 160;
+	algo->wake_max_unstable_nodes = 24;
+	algo->wake_max_unstable_line_nodes = 12;
+	algo->safe_commit_no_finger_frames = 30;
+	algo->runtime_blreset_enabled = true;
+	algo->runtime_blreset_confirm_frames = 5;
+	algo->runtime_blreset_cooldown = 240;
+	algo->runtime_noise_threshold = 1800;
+	algo->runtime_noise_line_nodes = 20;
+	algo->runtime_noise_total_nodes = 180;
+	for (int i = 0; i < 10; i++) {
+		algo->safe_reset_push_threshold[i] =
+			hx_safe_reset_push_default[i];
+		algo->safe_reset_time_threshold[i] =
+			hx_safe_reset_time_default[i];
+		algo->safe_reset_trigger_count[i] =
+			hx_safe_reset_trigger_default[i];
+		algo->safe_reset_screen_on_window[i] =
+			hx_safe_reset_screen_on_default[i];
+		algo->safe_reset_push_threshold_side[i] =
+			hx_safe_reset_push_default[i];
+		algo->safe_reset_time_threshold_side[i] =
+			hx_safe_reset_time_default[i];
+		algo->safe_reset_trigger_count_side[i] =
+			hx_safe_reset_trigger_default[i];
+		algo->safe_reset_screen_on_window_side[i] =
+			hx_safe_reset_screen_on_default[i];
+	}
+	algo->safe_candidate_armed = true;
+	algo->safe_queue_full_pushes = 0;
+	algo->safe_prev_flags = algo->safe_flags;
+	algo->safe_flags = 0;
 	algo->cmf_enabled        = true;
-	algo->cmf_exclusion      = 250;
-	algo->cmf_max_correction = 500;
-	algo->iir_enabled        = true;
+	/* HX83121A firmware uses flash[0x69] = 1: BLIIR consumes the
+	 * pre-CMF snapshot, while detection continues to use the CMF output.
+	 */
+	algo->bliir_use_pre_cmf_raw = true;
+	algo->cmf_exclusion      = 2000;
+	algo->cmf_max_correction = 2000;
+	/* v1.1.2 removed GridIIR from the active pipeline.  Keep the compatible
+	 * sysfs implementation available, but do not enable it by default.
+	 */
+	algo->iir_enabled        = false;
 	algo->iir_decay_weight   = 200;
 	algo->iir_decay_step     = 80;
 	algo->iir_noise_floor    = 5;
 	algo->iir_gate_floor     = 200;
 	algo->iir_gate_ratio_q8  = 26;
-	algo->macro_threshold    = 800;
-	algo->peak_threshold     = 800;
+	algo->macro_threshold    = 280;
+	algo->peak_threshold     = 280;
+	algo->peak_local_radius = 1;
+	algo->peak_z8_enabled = true;
+	algo->peak_saddle_enabled = true;
+	algo->peak_saddle_radius = 2;
+	algo->peak_saddle_drop = 80;
+	algo->peak_signal_threshold_limit = 1000;
+	algo->peak_edge_threshold = 300;
+	algo->peak_macro_min_area = 3;
+	algo->peak_continue_min_area = 1;
+	algo->peak_continue_min_signal = 900;
+	algo->peak_single_track_continue_min_signal = 650;
+	algo->peak_continue_dist2 = 220 * 220;
+	algo->peak_fast_start_min_signal = 1500;
+	algo->peak_fast_start_edge_cells = 4;
 	algo->palm_enabled       = true;
 	algo->palm_area_threshold    = 50;
 	algo->palm_signal_threshold  = 80000;
 	algo->palm_density_low       = 400;
+	algo->palm_box_enabled = true;
+	algo->palm_box_expand_rows = 9;
+	algo->palm_box_expand_cols = 10;
+	algo->palm_box_match_distance = 6;
+	algo->palm_box_max_hold = 0;
+	algo->zone_cleanup_enabled = true;
+	algo->zone_max_radius = 3;
+	algo->zone_threshold_numer = 0x40;
+	algo->zone_threshold_shift = 7;
 	algo->pressure_enabled   = false;
 	algo->edge_comp_enabled = true;
 	algo->edge_boost_pct   = 50;   /* 50% signal boost on border pixels  */
 	algo->edge_push_q8     = 128;  /* push up to 0.5 grid cells outward  */
 	algo->edge_blend_q8    = 512;  /* blend over 2 grid cells from edge  */
+	algo->edge_reject_enabled = true;
+	algo->edge_reject_margin = 24;
+	algo->edge_reject_min_signal = 500;
 	algo->track_dist2_max   = HIMAX_TRACK_MATCH_DIST2;
 	algo->track_lost_frames = HIMAX_TRACK_LOST_FRAMES;
 	algo->debounce_base     = HIMAX_NEW_TOUCH_DEBOUNCE;
 	algo->track_smoothing   = true;
 	algo->track_active_guard   = true;
-	algo->track_start_debounce = 2;
+	algo->track_start_debounce = 1;
 	algo->track_jump_dist2     = 0;  /* disabled by default */
+	algo->hungarian_enabled = true;
+	algo->debounce_weak_extra = 1;
+	algo->debounce_edge_extra = 1;
+	algo->debounce_strong_signal = 3000;
+	algo->firmware_edge_fast_start = true;
+	algo->split_peak_confirm_frames = 8;
+	algo->split_peak_dist2 = 300 * 300;
+	algo->split_cross_zone_confirm_frames = 4;
+	algo->split_cross_zone_dist2 = 180 * 180;
+	algo->track_peak_id_penalty = 40 * 40;
+	algo->ghost_enabled = true;
+	algo->ghost_row_distance = 32;
+	algo->ghost_weak_ratio_q8 = 96;
+	algo->ghost_min_col_distance = 300;
+	algo->euro_enabled = true;
+	algo->euro_alpha_min_q8 = 64;
+	algo->euro_alpha_max_q8 = 224;
+	algo->euro_speed_threshold = 24;
 }
 
-/* ======================================================================== */
-/* Phase 1A — baseline subtraction                                          */
-/* ======================================================================== */
-
-static void hx_prepare_frame_baseline(struct hx_algo *algo, const u16 *raw)
+static void hx_algo_clear_transient_state(struct hx_algo *algo)
 {
-	int r, c;
-
-	for (r = 0; r < HX_ROWS; r++) {
-		for (c = 0; c < HX_COLS; c++) {
-			int idx = r * HX_COLS + c;
-			s32 sample = (s32)le16_to_cpup(raw + idx) - HX_BASELINE;
-
-			algo->frame[r][c] = clamp_t(s32, sample, SHRT_MIN, SHRT_MAX);
-		}
-	}
-
-	/* pixel [0][0] is always invalid on this panel layout */
-	algo->frame[0][0] = 0;
-}
-
-/* ======================================================================== */
-/* Phase 1A½ — edge signal boost                                            */
-/*                                                                           */
-/* Compensate reduced capacitive sensitivity at sensor borders by scaling   */
-/* border pixels upward.  Row 0/last and col 0/last get the full boost;    */
-/* row 1/last-1 and col 1/last-1 get half.  Corner pixels (on two borders) */
-/* are boosted once from each axis (multiplicative).                         */
-/* ======================================================================== */
-
-static void hx_edge_boost(struct hx_algo *algo)
-{
-	int r, c;
-	s32 pct = algo->edge_boost_pct;
-	s32 half_pct = pct / 2;
-
-	if (!algo->edge_comp_enabled || pct <= 0)
-		return;
-
-	/* Boost border rows: row 0 and row HX_ROWS-1 (full), row 1 and HX_ROWS-2 (half) */
-	for (c = 0; c < HX_COLS; c++) {
-		s32 v;
-
-		/* Top edge */
-		v = algo->frame[0][c];
-		if (v > 0)
-			algo->frame[0][c] = clamp_t(s32, v + v * pct / 100, 0, SHRT_MAX);
-		v = algo->frame[1][c];
-		if (v > 0)
-			algo->frame[1][c] = clamp_t(s32, v + v * half_pct / 100, 0, SHRT_MAX);
-
-		/* Bottom edge */
-		v = algo->frame[HX_ROWS - 1][c];
-		if (v > 0)
-			algo->frame[HX_ROWS - 1][c] = clamp_t(s32, v + v * pct / 100, 0, SHRT_MAX);
-		v = algo->frame[HX_ROWS - 2][c];
-		if (v > 0)
-			algo->frame[HX_ROWS - 2][c] = clamp_t(s32, v + v * half_pct / 100, 0, SHRT_MAX);
-	}
-
-	/* Boost border columns: col 0 and col HX_COLS-1 (full), col 1 and HX_COLS-2 (half) */
-	for (r = 0; r < HX_ROWS; r++) {
-		s32 v;
-
-		/* Left edge */
-		v = algo->frame[r][0];
-		if (v > 0)
-			algo->frame[r][0] = clamp_t(s32, v + v * pct / 100, 0, SHRT_MAX);
-		v = algo->frame[r][1];
-		if (v > 0)
-			algo->frame[r][1] = clamp_t(s32, v + v * half_pct / 100, 0, SHRT_MAX);
-
-		/* Right edge */
-		v = algo->frame[r][HX_COLS - 1];
-		if (v > 0)
-			algo->frame[r][HX_COLS - 1] = clamp_t(s32, v + v * pct / 100, 0, SHRT_MAX);
-		v = algo->frame[r][HX_COLS - 2];
-		if (v > 0)
-			algo->frame[r][HX_COLS - 2] = clamp_t(s32, v + v * half_pct / 100, 0, SHRT_MAX);
-	}
-}
-
-/* ======================================================================== */
-/* Phase 1B — CMF (Common Mode Filter)                                      */
-/*                                                                           */
-/* Removes charger-induced common-mode noise by subtracting per-row and     */
-/* per-column offsets computed from "quiet" pixels (|val| < exclusion).     */
-/* DualDim mode: rows first, then columns.                                   */
-/* ======================================================================== */
-
-static void hx_apply_cmf(struct hx_algo *algo)
-{
-	int r, c;
-
-	/* Row pass */
-	for (r = 0; r < HX_ROWS; r++) {
-		s32 sum = 0, count = 0, offset;
-
-		for (c = 0; c < HX_COLS; c++) {
-			s16 v = algo->frame[r][c];
-
-			if (abs((int)v) < algo->cmf_exclusion) {
-				sum += v;
-				count++;
-			}
-		}
-		if (!count)
-			continue;
-
-		offset = clamp_t(s32, sum / count,
-				 -algo->cmf_max_correction,
-				  algo->cmf_max_correction);
-		for (c = 0; c < HX_COLS; c++) {
-			s32 corrected = (s32)algo->frame[r][c] - offset;
-
-			algo->frame[r][c] = clamp_t(s32, corrected, SHRT_MIN, SHRT_MAX);
-		}
-	}
-
-	/* Column pass */
-	for (c = 0; c < HX_COLS; c++) {
-		s32 sum = 0, count = 0, offset;
-
-		for (r = 0; r < HX_ROWS; r++) {
-			s16 v = algo->frame[r][c];
-
-			if (abs((int)v) < algo->cmf_exclusion) {
-				sum += v;
-				count++;
-			}
-		}
-		if (!count)
-			continue;
-
-		offset = clamp_t(s32, sum / count,
-				 -algo->cmf_max_correction,
-				  algo->cmf_max_correction);
-		for (r = 0; r < HX_ROWS; r++) {
-			s32 corrected = (s32)algo->frame[r][c] - offset;
-
-			algo->frame[r][c] = clamp_t(s32, corrected, SHRT_MIN, SHRT_MAX);
-		}
-	}
-}
-
-/* ======================================================================== */
-/* Phase 1C — GridIIR temporal filter                                       */
-/*                                                                           */
-/* Per-pixel exponential decay for noise suppression.  Pixels above a       */
-/* dynamic threshold (proportional to the frame maximum) bypass the filter  */
-/* so real touch signals are never attenuated.                               */
-/* ======================================================================== */
-
-static void hx_apply_iir(struct hx_algo *algo)
-{
-	int r, c;
-	s32 frame_max = 0;
-	s32 dyn_threshold;
-	u16 decay_weight, decay_step;
-
-	if (!algo->iir_enabled) {
-		memcpy(algo->iir_history, algo->frame, sizeof(algo->frame));
-		algo->iir_initialized = true;
-		return;
-	}
-
-	if (!algo->iir_initialized) {
-		memcpy(algo->iir_history, algo->frame, sizeof(algo->frame));
-		algo->iir_initialized = true;
-		return;
-	}
-
-	for (r = 0; r < HX_ROWS; r++)
-		for (c = 0; c < HX_COLS; c++)
-			frame_max = max(frame_max, abs((int)algo->frame[r][c]));
-
-	dyn_threshold = max((frame_max * algo->iir_gate_ratio_q8) >> 8,
-			    (s32)algo->iir_gate_floor);
-	decay_weight  = min_t(u16, algo->iir_decay_weight, 256);
-	decay_step    = algo->iir_decay_step;
-
-	for (r = 0; r < HX_ROWS; r++) {
-		for (c = 0; c < HX_COLS; c++) {
-			s32 cur = algo->frame[r][c];
-			s32 output;
-
-			if (cur >= dyn_threshold) {
-				output = cur;
-			} else {
-				s32 hist  = algo->iir_history[r][c];
-				s32 mixed = decay_weight * cur +
-					    (256 - decay_weight) * hist;
-
-				output = mixed >> 8;
-				output = max(0, output - (s32)decay_step);
-				if (output < algo->iir_noise_floor)
-					output = 0;
-			}
-
-			algo->frame[r][c]       = clamp_t(s32, output, SHRT_MIN, SHRT_MAX);
-			algo->iir_history[r][c] = algo->frame[r][c];
-		}
-	}
-}
-
-/* ======================================================================== */
-/* Phase 1 entry point                                                       */
-/* ======================================================================== */
-
-void hx_preprocess_frame(struct hx_algo *algo, const u16 *raw)
-{
-	hx_prepare_frame_baseline(algo, raw);
-
-	if (algo->cmf_enabled)
-		hx_apply_cmf(algo);
-
-	hx_edge_boost(algo);
-
-	hx_apply_iir(algo);
-}
-
-/* ======================================================================== */
-/* Helpers                                                                   */
-/* ======================================================================== */
-
-/* Debug helper — kept for bring-up and signal-quality checks. */
-static void __maybe_unused dump_frame(const struct hx_algo *algo)
-{
-	if (!IS_ENABLED(CONFIG_DYNAMIC_DEBUG))
-		return;
-
-	char buf[1024];
-
-	pr_warn("Frame start\n");
-	for (int i = 0, offset; i < HX_PIXELS; i++) {
-		if (i % HX_COLS == 0) {
-			if (i)
-				pr_info("%s\n", buf);
-			offset = sprintf(buf, "%04x:", i);
-		}
-		offset += sprintf(buf + offset, " %04x",
-				  (u16)max_t(s16, 0,
-					     algo->frame[i / HX_COLS][i % HX_COLS]));
-	}
-}
-
-/*
- * Clamp-to-zero accessor: returns 0 for out-of-bounds or negative values so
- * neighbour lookups near the grid edge never need special-casing.
- */
-static inline s16 hx_frame_at(const struct hx_algo *algo, int r, int c)
-{
-	s16 val;
-
-	if (r < 0 || r >= HX_ROWS || c < 0 || c >= HX_COLS)
-		return 0;
-	val = algo->frame[r][c];
-	return val > 0 ? val : 0;
-}
-
-/* ======================================================================== */
-/* Phase 2A — macro-zone detection (8-connected BFS)                        */
-/* ======================================================================== */
-
-void hx_detect_macro_zones(struct hx_algo *algo)
-{
-	static const int dr[] = {-1, -1, -1, 0, 0, 1, 1, 1};
-	static const int dc[] = {-1,  0,  1, -1, 1, -1, 0, 1};
-	u16 head, tail;
-	int r, c, d;
-
-	memset(algo->visited, 0, sizeof(algo->visited));
+	/* Scratch/result arrays are guarded by their counts or cleared by the
+	 * pipeline stage that consumes them.  Reset only persistent state here;
+	 * bulk-clearing every backing array added latency without changing what
+	 * the next frame can observe.
+	 */
+	memset(algo->frame, 0, sizeof(algo->frame));
+	memset(algo->peak_competition, 0, sizeof(algo->peak_competition));
+	memset(algo->baseline_release_hold, 0,
+	       sizeof(algo->baseline_release_hold));
+	memset(algo->tracks, 0, sizeof(algo->tracks));
+	/* An invalid history makes the first frame after a runtime IIR enable
+	 * seed the complete buffer before it is read.
+	 */
+	algo->iir_initialized = false;
+	algo->prev_raw_valid = false;
+	memset(algo->prev_raw, 0, sizeof(algo->prev_raw));
+	algo->blreset_raw_jump_frames = 0;
+	algo->blreset_raw_jump_elapsed_ms = 0;
+	algo->blreset_over_noise_frames = 0;
+	algo->blreset_state = HX_BLRESET_IDLE;
+	algo->blreset_reason_mask = 0;
+	algo->blreset_reason_elapsed_ms = 0;
+	algo->blreset_abnormal_type_flags = 0;
+	memset(algo->blreset_abnormal_type_elapsed, 0,
+	       sizeof(algo->blreset_abnormal_type_elapsed));
+	algo->blreset_triggered = false;
+	algo->blreset_all_touch_abnormal = false;
+	algo->blreset_concurrent_touch = false;
+	algo->blreset_baseline_state = 0;
+	algo->blreset_baseline_stable_frames = 0;
+	algo->blreset_baseline_elapsed_ms = 0;
+	algo->blreset_normal_baseline_ready = false;
+	algo->blreset_clean_baseline_captured = false;
+	algo->blreset_wake_abnormal_frames = 0;
+	algo->blreset_wake_abnormal_elapsed_ms = 0;
+	algo->blreset_wake_triggered = false;
+	algo->blreset_dirty_elapsed_ms = 0;
+	algo->blreset_dirty_triggered = false;
+	algo->shb_state = 0;
+	algo->shb_flags = 0;
+	algo->shb_capture_frame = 0;
+	memset(algo->shb_raw_capture, 0, sizeof(algo->shb_raw_capture));
+	algo->blrecal_frame = 0;
+	algo->blrecal_abnormal_count = 0;
+	algo->blrecal_requested = false;
+	/* Preserve the converged per-cell baseline across display/lid/idle and
+	 * hardware reinitialisation.  Force the next valid frame to re-evaluate
+	 * recovery instead of inheriting a stale touch/freeze transition.
+	 */
+	algo->baseline_prev_had_signal = false;
+	algo->baseline_had_freeze = algo->baseline_initialized;
+	algo->baseline_recovery_frames = 0;
+	algo->baseline_no_touch_stable_frames = 0;
+	algo->baseline_stage = HX_BLSM_NO_TOUCH_STABLE;
+	algo->baseline_prev_stage = HX_BLSM_NO_TOUCH_STABLE;
+	algo->baseline_stage_frames = 0;
+	algo->baseline_stage_elapsed_ms = 0;
+	algo->baseline_touch_latched = false;
+	algo->baseline_stage_allows_update = false;
+	algo->baseline_stage_force_update = false;
+	algo->baseline_stage_reset = false;
+	algo->baseline_stage_update_step = 0;
+	algo->baseline_stage_action = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->baseline_stage_update_count = 0;
+	algo->baseline_stage_reset_action_count = 0;
+	algo->baseline_stage_hold_count = 0;
+	algo->baseline_stage_force_count = 0;
+#endif
+	algo->baseline_touch_hold = false;
+	algo->baseline_touch_seen = false;
+	algo->baseline_held_in_hand = false;
+	algo->baseline_touch_release_frames = 0;
+	algo->baseline_post_reacquire_hold = 0;
+	algo->baseline_reacquire_pending = false;
+	algo->baseline_screen_on_hand_state = HX_HAND_NONE;
+	algo->baseline_guard_state = HX_BASELINE_GUARD_NORMAL;
+	algo->baseline_guard_clean_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->diag_safe_compare_result = HX_SAFE_COMPARE_NOT_RUN;
+	algo->diag_safe_improvement_frames = 0;
+	algo->diag_safe_regression_frames = 0;
+	algo->diag_blreset_recommended = false;
+	algo->diag_frame_seq = 0;
+	algo->diag_common_diff = 0;
+	algo->diag_frame_max = 0;
+	algo->diag_has_signal = 0;
+	algo->diag_zones = 0;
+	algo->diag_peaks = 0;
+	algo->diag_contacts_pre_filter = 0;
+	algo->diag_contacts_post_filter = 0;
+	algo->diag_active_tracks = 0;
+	algo->diag_reported_tracks = 0;
+#endif
+	algo->zone_arena_used = 0;
 	algo->zone_count = 0;
-
-	for (r = 0; r < HX_ROWS; r++) {
-		for (c = 0; c < HX_COLS; c++) {
-			int idx = r * HX_COLS + c;
-			struct hx_macro_zone *zone;
-
-			if (algo->visited[idx])
-				continue;
-			if (algo->frame[r][c] < algo->macro_threshold)
-				continue;
-			if (algo->zone_count >= HX_MAX_ZONES)
-				return;
-
-			zone = &algo->zones[algo->zone_count];
-			zone->area       = 0;
-			zone->signal_sum = 0;
-			zone->min_r = r;  zone->max_r = r;
-			zone->min_c = c;  zone->max_c = c;
-
-			/* Ring-buffer BFS using the pre-allocated queue. */
-			head = 0;
-			tail = 0;
-			algo->bfs_queue[tail++] = idx;
-			algo->visited[idx] = 1;
-
-			while (head != tail) {
-				int ci = algo->bfs_queue[head++];
-				int cr = ci / HX_COLS;
-				int cc = ci % HX_COLS;
-				s16 sig = algo->frame[cr][cc];
-
-				if (zone->area < HX_ZONE_PX_MAX)
-					zone->pixels[zone->area] = ci;
-				zone->area++;
-				if (sig > 0)
-					zone->signal_sum += sig;
-
-				if (cr < zone->min_r) zone->min_r = cr;
-				if (cr > zone->max_r) zone->max_r = cr;
-				if (cc < zone->min_c) zone->min_c = cc;
-				if (cc > zone->max_c) zone->max_c = cc;
-
-				for (d = 0; d < 8; d++) {
-					int nr = cr + dr[d];
-					int nc = cc + dc[d];
-					int ni;
-
-					if (nr < 0 || nr >= HX_ROWS ||
-					    nc < 0 || nc >= HX_COLS)
-						continue;
-					ni = nr * HX_COLS + nc;
-					if (algo->visited[ni])
-						continue;
-					if (algo->frame[nr][nc] < algo->macro_threshold)
-						continue;
-					algo->visited[ni] = 1;
-					algo->bfs_queue[tail++] = ni;
-				}
-			}
-
-			algo->zone_count++;
-		}
-	}
+	algo->peak_count = 0;
+	algo->prev_peak_count = 0;
+	algo->next_peak_id = 1;
+	algo->contact_count = 0;
+	algo->palm_box_count = 0;
+	algo->touch_active = false;
+	algo->touch_start_frames = 0;
+	algo->firmware_finger_present = false;
+	algo->fast_edge_start_pending = false;
+	algo->wake_raw_finger_override = false;
+	algo->wake_raw_finger_release_frames = 0;
+	algo->safe_no_finger_frames = 0;
+	algo->safe_candidate_armed = false;
+	algo->safe_candidate_confirming = false;
+	algo->safe_candidate_screen_epoch = 0;
+	algo->safe_confirm_common_sum = 0;
+	algo->safe_confirm_common_last = 0;
+	algo->runtime_safe_improvement_frames = 0;
+	algo->runtime_safe_regression_frames = 0;
+	algo->safe_baseline_invalid_frames = 0;
+	algo->safe_side_reset_frames = 0;
+	algo->safe_reset_in_debounce = false;
+	algo->safe_sync_reset_side_area = false;
+	algo->safe_signal_stable_frames = 0;
+	algo->safe_valid_touch_count = 0;
+	algo->safe_abnormal_touch_count = 0;
+	algo->safe_current_positive_nodes = 0;
+	algo->safe_current_negative_nodes = 0;
+	algo->runtime_blreset_cooldown_frames = 0;
 }
 
-/* ======================================================================== */
-/* Phase 2B — palm rejection                                                 */
-/*                                                                           */
-/* Four integer-only rules.  Any zone matching a rule is discarded.         */
-/* Rule 1: area >= palm_area_threshold                (large footprint)     */
-/* Rule 2: signal_sum >= palm_signal_threshold         (strong integrated)  */
-/* Rule 3: area >= 20 && density < palm_density_low   (spread low signal)  */
-/* Rule 4: area >= 10 && aspect-ratio >= 4:1           (elongated shape)   */
-/* ======================================================================== */
-
-void hx_reject_palms(struct hx_algo *algo)
+void hx_algo_clear_live_state(struct hx_algo *algo)
 {
-	u8 dst = 0;
-	u8 i;
+	hx_algo_clear_transient_state(algo);
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->live_clear_count++;
+#endif
+}
 
-	if (!algo->palm_enabled)
+void hx_algo_full_reset(struct hx_algo *algo)
+{
+	hx_algo_clear_transient_state(algo);
+	memset(algo->baseline_q8, 0, sizeof(algo->baseline_q8));
+	memset(algo->safe_baseline_q8, 0, sizeof(algo->safe_baseline_q8));
+	memset(algo->wake_candidate_q8, 0,
+	       sizeof(algo->wake_candidate_q8));
+	memset(algo->safe_baselines, 0, sizeof(algo->safe_baselines));
+	memset(&algo->platform, 0, sizeof(algo->platform));
+	hx_safe_baseline_queue_reset(algo);
+	hx_safe_baseline_temp_reset(algo);
+	/* TSACore_ResetInit owns these statistics.  A display/idle live-clear
+	 * must not erase accumulated abnormal-duration evidence.
+	 */
+	memset(algo->safe_reset_reason_frames, 0,
+	       sizeof(algo->safe_reset_reason_frames));
+	memset(algo->safe_reset_reason_last_frame, 0,
+	       sizeof(algo->safe_reset_reason_last_frame));
+	memset(algo->safe_reset_reason_frames_side, 0,
+	       sizeof(algo->safe_reset_reason_frames_side));
+	memset(algo->safe_reset_reason_last_frame_side, 0,
+	       sizeof(algo->safe_reset_reason_last_frame_side));
+	for (int i = 0; i < 10; i++)
+		algo->safe_reset_push_count[i] = 0;
+	for (int i = 0; i < 10; i++)
+		algo->safe_reset_push_count_side[i] = 0;
+	algo->safe_reset_reason_mask = 0;
+	algo->safe_reset_reason_mask_side = 0;
+	/* Zero means use the per-reason official time threshold.  Host tests may
+	 * set this explicitly as a deterministic threshold override.
+	 */
+	algo->safe_reset_reason_trigger_frames = 0;
+	algo->baseline_initialized = false;
+	algo->blreset_state = HX_BLRESET_IDLE;
+	algo->blreset_reason_mask = 0;
+	algo->blreset_reason_elapsed_ms = 0;
+	algo->blreset_trigger_count = 0;
+	algo->blreset_clear_count = 0;
+	algo->blreset_triggered = false;
+	algo->blreset_baseline_state = 0;
+	algo->blreset_baseline_stable_frames = 0;
+	algo->blreset_baseline_elapsed_ms = 0;
+	algo->blreset_normal_baseline_ready = false;
+	algo->blreset_clean_baseline_captured = false;
+	algo->blreset_wake_abnormal_frames = 0;
+	algo->blreset_wake_abnormal_elapsed_ms = 0;
+	algo->blreset_wake_triggered = false;
+	algo->blreset_dirty_elapsed_ms = 0;
+	algo->blreset_dirty_triggered = false;
+	algo->normal_baseline_valid = false;
+	memset(algo->normal_baseline_q8, 0,
+	       sizeof(algo->normal_baseline_q8));
+	algo->baseline_hw_reset = false;
+	algo->safe_baseline_valid = false;
+	algo->safe_baseline_count = 0;
+	algo->safe_baseline_selected = 0;
+	algo->safe_flags = 0;
+	algo->safe_prev_flags = 0;
+	algo->safe_baseline_selected_score = 0;
+	algo->safe_baseline_next = 0;
+	algo->safe_baseline_generation = 0;
+	algo->screen_epoch = 0;
+	algo->frame_sequence = 0;
+	algo->wake_qualifying = false;
+	algo->wake_candidate_valid = false;
+	algo->wake_needs_double_confirm = false;
+	algo->wake_candidate_frames = 0;
+	algo->wake_finger_frames = 0;
+	algo->wake_finger_reject_frames = 0;
+	algo->wake_finger_common_sum = 0;
+	algo->wake_finger_common_last = 0;
+	algo->safe_no_finger_frames = 0;
+	algo->safe_candidate_armed = true;
+	algo->safe_candidate_confirming = false;
+	algo->safe_candidate_screen_epoch = 0;
+	algo->safe_confirm_common_sum = 0;
+	algo->safe_confirm_common_last = 0;
+	algo->runtime_safe_improvement_frames = 0;
+	algo->runtime_safe_regression_frames = 0;
+	algo->safe_baseline_invalid_frames = 0;
+	algo->safe_side_reset_frames = 0;
+	algo->safe_reset_in_debounce = false;
+	algo->safe_sync_reset_side_area = false;
+	algo->safe_signal_stable_frames = 0;
+	algo->safe_valid_touch_count = 0;
+	algo->safe_abnormal_touch_count = 0;
+	algo->safe_current_positive_nodes = 0;
+	algo->safe_current_negative_nodes = 0;
+	algo->safe_reset_reason_trigger_frames = 0;
+	algo->runtime_blreset_cooldown_frames = 0;
+	algo->baseline_prev_had_signal = false;
+	algo->baseline_had_freeze = false;
+	algo->baseline_recovery_frames = 0;
+	algo->baseline_no_touch_stable_frames = 0;
+	algo->baseline_stage = HX_BLSM_NO_TOUCH_STABLE;
+	algo->baseline_prev_stage = HX_BLSM_NO_TOUCH_STABLE;
+	algo->baseline_stage_frames = 0;
+	algo->baseline_stage_elapsed_ms = 0;
+	algo->baseline_touch_latched = false;
+	algo->baseline_stage_allows_update = false;
+	algo->baseline_stage_force_update = false;
+	algo->baseline_stage_reset = false;
+	algo->baseline_stage_update_step = 0;
+	algo->baseline_stage_action = 0;
+	algo->baseline_post_reacquire_hold = 0;
+	algo->baseline_screen_on_hand_state = HX_HAND_NONE;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->baseline_generation++;
+	algo->full_reset_count++;
+#endif
+}
+
+void hx_copy_raw_to_baseline(s32 *dst, const u16 *raw)
+{
+	int i;
+
+	for (i = 0; i < HX_PIXELS; i++)
+		dst[i] = (s32)le16_to_cpup(raw + i) <<
+			 HX_BASELINE_FRACTION_BITS;
+}
+
+void hx_restore_working_from_safe(struct hx_algo *algo, s32 common,
+				  bool touch_hold, bool touch_seen)
+{
+	int i;
+
+	/* Diagnostics can freeze the working grid.  Wake fallback and runtime
+	 * BLReset must obey the same switch as ordinary per-frame learning.
+	 */
+	if (!algo->baseline_enabled)
 		return;
-
-	for (i = 0; i < algo->zone_count; i++) {
-		struct hx_macro_zone *z = &algo->zones[i];
-		u16 bbox_w, bbox_h, max_side, min_side;
-		bool reject = false;
-
-		/* Rule 1 */
-		if (z->area >= algo->palm_area_threshold) {
-			reject = true;
-			goto next;
-		}
-
-		/* Rule 2 */
-		if (z->signal_sum >= algo->palm_signal_threshold) {
-			reject = true;
-			goto next;
-		}
-
-		/* Rule 3: density = signal_sum / area < palm_density_low
-		 *         Rewritten without division: signal_sum < low * area */
-		if (z->area >= 20 &&
-		    z->signal_sum < (s32)algo->palm_density_low * z->area) {
-			reject = true;
-			goto next;
-		}
-
-		/* Rule 4: aspect ratio — fixed-point: max*256 >= 4*min*256 */
-		bbox_w   = z->max_c - z->min_c + 1;
-		bbox_h   = z->max_r - z->min_r + 1;
-		max_side = max(bbox_w, bbox_h);
-		min_side = min(bbox_w, bbox_h);
-		if (z->area >= 10 && min_side > 0 &&
-		    (u32)max_side * 256 >= 1024u * min_side)
-			reject = true;
-
-next:
-		if (!reject) {
-			if (dst != i)
-				algo->zones[dst] = *z;
-			dst++;
-		}
-	}
-
-	algo->zone_count = dst;
+	for (i = 0; i < HX_PIXELS; i++)
+		algo->baseline_q8[i] = clamp_t(s32,
+			algo->safe_baseline_q8[i] +
+			common * (1 << HX_BASELINE_FRACTION_BITS),
+			0, 0xffff << HX_BASELINE_FRACTION_BITS);
+	memset(algo->baseline_release_hold, 0,
+	       sizeof(algo->baseline_release_hold));
+	algo->baseline_initialized = true;
+	algo->baseline_prev_had_signal = true;
+	algo->baseline_had_freeze = true;
+	algo->baseline_recovery_frames = 0;
+	algo->baseline_touch_hold = touch_hold;
+	algo->baseline_touch_seen = touch_hold && touch_seen;
+	algo->baseline_held_in_hand = touch_hold;
+	algo->baseline_touch_release_frames = 0;
+	algo->baseline_guard_state = touch_hold ?
+		HX_BASELINE_GUARD_PROTECTED : HX_BASELINE_GUARD_NORMAL;
+	algo->baseline_screen_on_hand_state = touch_hold ?
+		HX_HAND_PROTECTED : HX_HAND_NONE;
+	algo->baseline_guard_clean_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	if (touch_hold)
+		algo->baseline_touch_hold_count++;
+#endif
 }
 
-/* ======================================================================== */
-/* Phase 2C — peak detection within surviving zones                         */
-/* ======================================================================== */
-
-/*
- * Asymmetric local-maximum test.
- *
- * "Before" neighbours (up + left in scan order) must be strictly less;
- * "after" neighbours (down + right) may be equal.  This breaks ties on
- * flat ridges so exactly one peak is produced per finger plateau.
- */
-static bool hx_is_asymmetric_peak(const struct hx_algo *algo, int r, int c)
+static bool hx_safe_baselines_compatible(const s32 *first_q8,
+					 const s32 *second_q8)
 {
-	s16 v = algo->frame[r][c];
-	int dr, dc;
+	s64 sum = 0;
+	s32 common;
+	s32 threshold = HX_BASELINE_CLEAN_LOCAL_THRESHOLD;
+	u16 divergent = 0;
+	int i;
 
-	for (dr = -1; dr <= 1; dr++) {
-		for (dc = -1; dc <= 1; dc++) {
-			int nr, nc;
-			s16 nv;
-			bool after;
+	for (i = 1; i < HX_PIXELS; i++)
+		sum += (first_q8[i] - second_q8[i]) >>
+			HX_BASELINE_FRACTION_BITS;
+	common = (s32)(sum / (HX_PIXELS - 1));
+	if (abs(common) > HX_BASELINE_CLEAN_LOCAL_THRESHOLD)
+		return false;
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 local = ((first_q8[i] - second_q8[i]) >>
+			HX_BASELINE_FRACTION_BITS) - common;
 
-			if (dr == 0 && dc == 0)
-				continue;
-			nr = r + dr;
-			nc = c + dc;
-			if (nr < 0 || nr >= HX_ROWS || nc < 0 || nc >= HX_COLS)
-				continue;
-			nv    = algo->frame[nr][nc];
-			after = (dr > 0) || (dr == 0 && dc > 0);
-			if (after) {
-				if (nv > v) return false;
-			} else {
-				if (nv >= v) return false;
-			}
-		}
+		if (abs(local) > threshold &&
+		    ++divergent > HX_BASELINE_CLEAN_MAX_NODES)
+			return false;
 	}
 	return true;
 }
 
-/*
- * Pressure-drift detector.
- *
- * A flat palm press produces a nearly-uniform row of elevated pixels with
- * low cross-row gradient.  Returns true when the peak signal falls in the
- * drift range [3/8, 3/4] of peak_threshold and the row gradient is low
- * while the row signal sum is high relative to the peak.
- */
-static bool hx_detect_pressure_drift(const struct hx_algo *algo, int r, int c)
+static void hx_safe_baseline_select_slot(struct hx_algo *algo, u8 slot)
 {
-	s16 peak_sig  = algo->frame[r][c];
-	s16 limit3_4  = (algo->peak_threshold * 3) >> 2;
-	s16 limit3_8  = (algo->peak_threshold * 3) >> 3;
-	int grad_sum  = 0;
-	int row_sum   = 0;
-	int col;
+	if (slot >= HX_SAFE_BASELINE_SLOTS ||
+	    !algo->safe_baselines[slot].valid ||
+	    algo->safe_baselines[slot].reset_pending)
+		return;
+	memcpy(algo->safe_baseline_q8,
+	       algo->safe_baselines[slot].baseline_q8,
+	       sizeof(algo->safe_baseline_q8));
+	algo->safe_baseline_selected = slot;
+	algo->safe_baseline_valid = true;
+	algo->safe_baselines[slot].pushed = true;
+	algo->safe_baselines[slot].use_count++;
+}
 
-	if (peak_sig > limit3_4 || peak_sig < limit3_8)
+void hx_safe_baseline_reset_selected(struct hx_algo *algo)
+{
+	struct hx_safe_baseline_entry *entry;
+
+	if (algo->safe_baseline_selected >= HX_SAFE_BASELINE_SLOTS)
+		return;
+	entry = &algo->safe_baselines[algo->safe_baseline_selected];
+	if (!entry->valid)
+		return;
+	entry->reset_pending = true;
+	entry->state = HX_SAFE_SLOT_RESET;
+	entry->pushed = false;
+	hx_safe_baseline_queue_remove(algo, algo->safe_baseline_selected);
+	algo->safe_baseline_valid = false;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->baseline_safe_reset_count++;
+#endif
+}
+
+bool hx_safe_baseline_promote_latest_confirmed(struct hx_algo *algo)
+{
+	u8 best = HX_SAFE_BASELINE_SLOTS;
+	u8 i;
+
+	/* BaselineQueue_GetLatestBuf walks the queue in reverse chronological
+	 * order.  Do not select by confidence/generation: those fields describe
+	 * trust, not recency.
+	 */
+	for (i = 0; i < algo->safe_queue_count; i++) {
+		u8 offset = algo->safe_queue_count - 1 - i;
+		u8 index = (algo->safe_queue_tail + offset) %
+			HX_SAFE_BASELINE_SLOTS;
+		u8 slot = algo->safe_queue_order[index];
+		struct hx_safe_baseline_entry *entry = &algo->safe_baselines[slot];
+
+		if (!entry->valid || entry->reset_pending ||
+		    entry->confidence < HX_SAFE_BASELINE_CONFIRMED)
+			continue;
+		best = slot;
+		break;
+	}
+	if (best == HX_SAFE_BASELINE_SLOTS)
 		return false;
-
-	for (col = 1; col < HX_COLS - 1; col++) {
-		int grad = abs((int)hx_frame_at(algo, r, col + 1) -
-			       (int)hx_frame_at(algo, r, col - 1));
-
-		if (grad > algo->peak_threshold / 3)
-			return false;   /* sharp spike → not drift */
-		grad_sum += grad;
-		if (algo->frame[r][col] > 0)
-			row_sum += algo->frame[r][col];
-	}
-
-	return (row_sum >= peak_sig * 9 / 2) &&
-	       (peak_sig * 6 >= grad_sum);
+	hx_safe_baseline_select_slot(algo, best);
+	return true;
 }
 
-/*
- * Insert a peak into the fixed-size peak array.  When the array is full,
- * replace the weakest existing entry if the new peak is stronger.
- */
-static void hx_insert_peak(struct hx_algo *algo, const struct hx_peak *p)
+void hx_safe_baseline_bootstrap(struct hx_algo *algo, const s32 *baseline_q8)
 {
-	int k, weakest;
+	struct hx_safe_baseline_entry *entry;
 
-	if (algo->peak_count < HX_MAX_PEAKS) {
-		algo->peaks[algo->peak_count++] = *p;
+	if (!algo->baseline_enabled)
+		return;
+	if (algo->safe_baseline_count) {
+		hx_safe_baseline_select_slot(algo, algo->safe_baseline_selected);
+		return;
+	}
+	entry = &algo->safe_baselines[0];
+	memcpy(entry->baseline_q8, baseline_q8, sizeof(entry->baseline_q8));
+	entry->valid = true;
+	entry->confidence = HX_SAFE_BASELINE_BOOTSTRAP;
+	entry->state = HX_SAFE_SLOT_PROVISIONAL;
+	entry->stable_frames = 1;
+	entry->reset_pending = false;
+	entry->pushed = false;
+	entry->generation = ++algo->safe_baseline_generation;
+	entry->screen_epoch = algo->screen_epoch;
+	entry->captured_frame = algo->frame_sequence;
+	hx_safe_baseline_queue_record(algo, 0);
+	algo->safe_baseline_pushes = min_t(u8,
+		algo->safe_baseline_pushes + 1, U8_MAX);
+	hx_safe_baseline_select_slot(algo, 0);
+}
+
+void hx_safe_baseline_commit(struct hx_algo *algo, const s32 *baseline_q8)
+{
+	struct hx_safe_baseline_entry *entry;
+	u8 slot = HX_SAFE_BASELINE_SLOTS;
+	u8 i;
+
+	if (!algo->baseline_enabled)
+		return;
+	for (i = 0; i < HX_SAFE_BASELINE_SLOTS; i++) {
+		if (!algo->safe_baselines[i].valid ||
+		    algo->safe_baselines[i].reset_pending)
+			continue;
+		if (hx_safe_baselines_compatible(
+			algo->safe_baselines[i].baseline_q8, baseline_q8)) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < HX_SAFE_BASELINE_SLOTS) {
+		entry = &algo->safe_baselines[slot];
+		/* Re-observing a grid in the same electrical session is not an
+		 * independent confirmation.  Only a later screen epoch may promote
+		 * recovery authority.
+		 */
+		if (entry->screen_epoch != algo->screen_epoch) {
+			if (entry->confidence < HX_SAFE_BASELINE_CONFIRMED)
+				entry->confidence = HX_SAFE_BASELINE_CONFIRMED;
+			else
+				entry->confidence = HX_SAFE_BASELINE_CROSS_WAKE;
+			entry->screen_epoch = algo->screen_epoch;
+			entry->state = entry->confidence >= HX_SAFE_BASELINE_CROSS_WAKE ?
+				HX_SAFE_SLOT_CROSS_WAKE : HX_SAFE_SLOT_CONFIRMED;
+			entry->stable_frames = 0;
+		}
+		entry->stable_frames = min_t(u16, entry->stable_frames + 1,
+						U16_MAX);
+		entry->reset_pending = false;
+		entry->generation = ++algo->safe_baseline_generation;
+		entry->captured_frame = algo->frame_sequence;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->baseline_safe_dedup_count++;
+#endif
+		hx_safe_baseline_select_slot(algo, slot);
+		return;
+	}
+	/* SafeBaseline_IsOKToPush limits replacements once the normal queue is
+	 * full; this prevents a noisy screen-on epoch from cycling all history.
+	 */
+	if (algo->safe_queue_count == HX_SAFE_BASELINE_SLOTS &&
+	    algo->safe_queue_full_pushes >= 3) {
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->baseline_safe_temporal_reject_count++;
+#endif
 		return;
 	}
 
-	weakest = 0;
-	for (k = 1; k < HX_MAX_PEAKS; k++) {
-		if (algo->peaks[k].z < algo->peaks[weakest].z)
-			weakest = k;
-	}
-	if (p->z > algo->peaks[weakest].z)
-		algo->peaks[weakest] = *p;
-}
-
-void hx_detect_peaks(struct hx_algo *algo)
-{
-	u8 zi;
-
-	algo->peak_count = 0;
-
-	/* --- Asymmetric local-max scan within each surviving zone --- */
-	for (zi = 0; zi < algo->zone_count; zi++) {
-		struct hx_macro_zone *zone = &algo->zones[zi];
-		u16 px_limit = min_t(u16, zone->area, HX_ZONE_PX_MAX);
-		u16 pi;
-
-		for (pi = 0; pi < px_limit; pi++) {
-			int idx = zone->pixels[pi];
-			int r = idx / HX_COLS;
-			int c = idx % HX_COLS;
-			s16 v = algo->frame[r][c];
-			struct hx_peak peak;
-			int dr, dc;
-			s32 nbr_sum = 0;
-
-			if (v < algo->peak_threshold)
-				continue;
-			if (!hx_is_asymmetric_peak(algo, r, c))
-				continue;
-			if (hx_detect_pressure_drift(algo, r, c))
-				continue;
-
-			for (dr = -1; dr <= 1; dr++)
-				for (dc = -1; dc <= 1; dc++) {
-					if (dr == 0 && dc == 0)
-						continue;
-					nbr_sum += hx_frame_at(algo, r + dr, c + dc);
-				}
-
-			peak = (struct hx_peak){
-				.r         = r,
-				.c         = c,
-				.z         = v,
-				.nbr_sum   = nbr_sum,
-				.zone_area = zone->area,
-			};
-			hx_insert_peak(algo, &peak);
-		}
-	}
-
-	/* --- Z8 isolation filter: (z >> 5) > nbr_sum → isolated spike --- */
-	{
-		u8 dst = 0, i;
-
-		for (i = 0; i < algo->peak_count; i++) {
-			if ((algo->peaks[i].z >> 5) <= algo->peaks[i].nbr_sum)
-				algo->peaks[dst++] = algo->peaks[i];
-		}
-		algo->peak_count = dst;
-	}
-
-	/* --- Zone minimum-area filter: area < 2 → reject (except edge peaks) --- */
-	{
-		u8 dst = 0, i;
-
-		for (i = 0; i < algo->peak_count; i++) {
-			bool on_edge = (algo->peaks[i].r == 0 ||
-					algo->peaks[i].r == HX_ROWS - 1 ||
-					algo->peaks[i].c == 0 ||
-					algo->peaks[i].c == HX_COLS - 1);
-
-			if (algo->peaks[i].zone_area >= 2 || on_edge)
-				algo->peaks[dst++] = algo->peaks[i];
-		}
-		algo->peak_count = dst;
-	}
-
-	/* --- Edge peak filter: weak edge peaks < max_sig * 5/8 --- */
-	{
-		int edge;
-
-		for (edge = 0; edge < 4; edge++) {
-			s16 max_sig = 0, cutoff;
-			u8 dst = 0, i;
-
-			for (i = 0; i < algo->peak_count; i++) {
-				bool on_edge;
-
-				switch (edge) {
-				case 0:  on_edge = algo->peaks[i].r == 0; break;
-				case 1:  on_edge = algo->peaks[i].r == HX_ROWS - 1; break;
-				case 2:  on_edge = algo->peaks[i].c == 0; break;
-				default: on_edge = algo->peaks[i].c == HX_COLS - 1; break;
-				}
-				if (on_edge && algo->peaks[i].z > max_sig)
-					max_sig = algo->peaks[i].z;
-			}
-			if (max_sig == 0)
-				continue;
-
-			cutoff = (max_sig >> 3) * 5;
-			for (i = 0; i < algo->peak_count; i++) {
-				bool on_edge;
-
-				switch (edge) {
-				case 0:  on_edge = algo->peaks[i].r == 0; break;
-				case 1:  on_edge = algo->peaks[i].r == HX_ROWS - 1; break;
-				case 2:  on_edge = algo->peaks[i].c == 0; break;
-				default: on_edge = algo->peaks[i].c == HX_COLS - 1; break;
-				}
-				if (!(on_edge && algo->peaks[i].z < cutoff))
-					algo->peaks[dst++] = algo->peaks[i];
-			}
-			algo->peak_count = dst;
-		}
-	}
-
-	/* --- Sort ascending by signal (selection sort, ≤20 elements) --- */
-	{
-		u8 i, j;
-
-		for (i = 0; i + 1 < algo->peak_count; i++) {
-			u8 min_idx = i;
-
-			for (j = i + 1; j < algo->peak_count; j++) {
-				if (algo->peaks[j].z < algo->peaks[min_idx].z)
-					min_idx = j;
-			}
-			if (min_idx != i)
-				swap(algo->peaks[i], algo->peaks[min_idx]);
-		}
-	}
-}
-
-/* ======================================================================== */
-/* Phase 2D — zone expansion + weighted centroid                            */
-/*                                                                           */
-/* For each peak, BFS-expand outward while signal >= 50% of the peak       */
-/* value.  Accumulate weighted centroid (Q8.8 fixed-point grid coords)     */
-/* using s64 intermediate products.  When the BFS meets pixels already     */
-/* owned by another peak, fall back to a 3x3 local centroid.               */
-/*                                                                           */
-/* Result: contacts[] filled, then converted to output coords [0, 65535].  */
-/* ======================================================================== */
-
-/*
- * Compute the zone expansion threshold: ~50% of min(peak_threshold, peak_z).
- * Uses integer multiply + shift: base * 0x40 >> 7 ≈ base * 0.5.
- */
-static inline s16 hx_zone_thold(s16 sig_thold, s16 peak_z)
-{
-	int base = min((int)sig_thold, (int)peak_z);
-	int result = (base * 0x40) >> 7;
-
-	return (s16)max(result, 1);
-}
-
-/*
- * Single-peak zone: BFS flood-fill weighted centroid.
- * Returns true if the expansion was clean (no overlap with other zones).
- */
-static bool hx_expand_single_peak(struct hx_algo *algo, int pi,
-				    struct hx_contact *ct)
-{
-	struct hx_peak *pk = &algo->peaks[pi];
-	s16 thold = hx_zone_thold(algo->peak_threshold, pk->z);
-	u8 zone_id = (u8)(pi + 1);
-	u16 head = 0, tail = 0;
-	int seed = pk->r * HX_COLS + pk->c;
-	bool clean = true;
-	s64 w_col = 0, w_row = 0;
-	s32 w_total = 0;
-	u16 area = 0;
-	s32 sig_sum = 0;
-
-	static const int dr[] = {-1, -1, -1, 0, 0, 1, 1, 1};
-	static const int dc[] = {-1,  0,  1, -1, 1, -1, 0, 1};
-
-	algo->zone_map[seed] = zone_id;
-	algo->bfs_queue[tail++] = seed;
-
-	while (head != tail) {
-		int idx = algo->bfs_queue[head++];
-		int r = idx / HX_COLS;
-		int c = idx % HX_COLS;
-		s16 sig = hx_frame_at(algo, r, c);
-		int d;
-
-		area++;
-		sig_sum += sig;
-		w_col += (s64)c * 128 * sig;
-		w_row += (s64)r * 128 * sig;
-		w_total += sig;
-
-		for (d = 0; d < 8; d++) {
-			int nr = r + dr[d];
-			int nc = c + dc[d];
-			int ni;
-
-			if (nr < 0 || nr >= HX_ROWS || nc < 0 || nc >= HX_COLS)
-				continue;
-			ni = nr * HX_COLS + nc;
-			if (algo->zone_map[ni]) {
-				if (algo->zone_map[ni] != zone_id)
-					clean = false;
-				continue;
-			}
-			if (hx_frame_at(algo, nr, nc) < thold)
-				continue;
-			algo->zone_map[ni] = zone_id;
-			algo->bfs_queue[tail++] = ni;
-		}
-	}
-
-	if (w_total > 0) {
-		ct->x = (s32)(w_col * 2 / w_total) + 0x80;
-		ct->y = (s32)(w_row * 2 / w_total) + 0x80;
-	} else {
-		ct->x = pk->c * 256 + 128;
-		ct->y = pk->r * 256 + 128;
-	}
-	ct->area = area;
-	ct->signal_sum = sig_sum;
-	ct->is_edge = (pk->r == 0 || pk->r == HX_ROWS - 1 ||
-		       pk->c == 0 || pk->c == HX_COLS - 1);
-
-	return clean;
-}
-
-/*
- * Multi-peak fallback: 3x3 local weighted centroid around the peak.
- */
-static void hx_local_centroid(struct hx_algo *algo, int pi,
-			       struct hx_contact *ct)
-{
-	struct hx_peak *pk = &algo->peaks[pi];
-	s64 w_col = 0, w_row = 0;
-	s32 w_total = 0;
-	u16 area = 0;
-	s32 sig_sum = 0;
-	int dr, dc;
-
-	for (dr = -1; dr <= 1; dr++) {
-		for (dc = -1; dc <= 1; dc++) {
-			int nr = pk->r + dr;
-			int nc = pk->c + dc;
-			s16 sig;
-
-			if (nr < 0 || nr >= HX_ROWS || nc < 0 || nc >= HX_COLS)
-				continue;
-			sig = hx_frame_at(algo, nr, nc);
-			if (sig <= 0)
-				continue;
-			w_col += (s64)nc * 128 * sig;
-			w_row += (s64)nr * 128 * sig;
-			w_total += sig;
-			area++;
-			sig_sum += sig;
-		}
-	}
-
-	if (w_total > 0) {
-		ct->x = (s32)(w_col * 2 / w_total) + 0x80;
-		ct->y = (s32)(w_row * 2 / w_total) + 0x80;
-	} else {
-		ct->x = pk->c * 256 + 128;
-		ct->y = pk->r * 256 + 128;
-	}
-	ct->area = area;
-	ct->signal_sum = sig_sum;
-	ct->is_edge = (pk->r == 0 || pk->r == HX_ROWS - 1 ||
-		       pk->c == 0 || pk->c == HX_COLS - 1);
-}
-
-/*
- * Edge compensation: push centroid outward toward the physical sensor
- * boundary.  The sensor extends ~0.5 cells beyond the last grid node,
- * but the weighted centroid is biased inward because there's no data
- * outside the grid.  This function linearly pushes edge contacts
- * outward, with maximum push at the boundary itself, fading to zero
- * at edge_blend_q8 distance from the edge.
- */
-static void hx_edge_compensate(struct hx_algo *algo, struct hx_contact *ct)
-{
-	s32 push_max = algo->edge_push_q8;
-	s32 blend    = algo->edge_blend_q8;
-	s32 dist, push;
-
-	if (!algo->edge_comp_enabled || push_max <= 0 || blend <= 0)
-		return;
-
-	/* Left boundary: distance = ct->x (Q8.8, 0 = grid col 0 center) */
-	dist = ct->x;
-	if (dist < blend) {
-		push = push_max * (blend - dist) / blend;
-		ct->x = max_t(s32, ct->x - push, 0);
-	}
-
-	/* Right boundary: distance from last col center */
-	dist = (HX_COLS - 1) * 256 + 128 - ct->x;
-	if (dist < blend) {
-		push = push_max * (blend - dist) / blend;
-		ct->x = min_t(s32, ct->x + push, (HX_COLS - 1) * 256 + 256);
-	}
-
-	/* Top boundary */
-	dist = ct->y;
-	if (dist < blend) {
-		push = push_max * (blend - dist) / blend;
-		ct->y = max_t(s32, ct->y - push, 0);
-	}
-
-	/* Bottom boundary */
-	dist = (HX_ROWS - 1) * 256 + 128 - ct->y;
-	if (dist < blend) {
-		push = push_max * (blend - dist) / blend;
-		ct->y = min_t(s32, ct->y + push, (HX_ROWS - 1) * 256 + 256);
-	}
-}
-
-void hx_expand_and_resolve(struct hx_algo *algo,
-			    struct input_mt_pos *pos, int *cnt)
-{
-	int i, n;
-
-	memset(algo->zone_map, 0, sizeof(algo->zone_map));
-	algo->contact_count = 0;
-
-	n = min_t(int, algo->peak_count, HIMAX_MAX_TOUCH);
-
-	for (i = 0; i < n; i++) {
-		struct hx_contact *ct = &algo->contacts[algo->contact_count];
-		bool clean;
-
-		clean = hx_expand_single_peak(algo, i, ct);
-		if (!clean)
-			hx_local_centroid(algo, i, ct);
-
-		/* Push edge centroids outward toward physical sensor boundary */
-		if (ct->is_edge)
-			hx_edge_compensate(algo, ct);
-
-		algo->contact_count++;
-	}
-
-	/* If more peaks than slots, keep the strongest signal_sum contacts */
-	if (algo->contact_count > HIMAX_MAX_TOUCH) {
-		/* Selection-sort descending by signal_sum, keep first MAX */
-		u8 ci, cj;
-
-		for (ci = 0; ci + 1 < algo->contact_count; ci++) {
-			u8 best = ci;
-
-			for (cj = ci + 1; cj < algo->contact_count; cj++) {
-				if (algo->contacts[cj].signal_sum >
-				    algo->contacts[best].signal_sum)
-					best = cj;
-			}
-			if (best != ci)
-				swap(algo->contacts[ci], algo->contacts[best]);
-		}
-		algo->contact_count = HIMAX_MAX_TOUCH;
-	}
-
-	/* Convert Q8.8 grid coordinates to output space matching rxtx2xy:
-	 *   x = ct->x / 6       (maps to [~21, ~2539])
-	 *   y = 5 * ct->y / 32  (maps to [~20, ~1580])
-	 * This matches the coordinate range the DT/touchscreen_properties
-	 * are calibrated for.
-	 */
-	*cnt = algo->contact_count;
-	for (i = 0; i < *cnt; i++) {
-		struct hx_contact *ct = &algo->contacts[i];
-
-		pos[i].x = clamp_val((s32)(ct->x / 6), 0, SZ_64K - 1);
-		pos[i].y = clamp_val((s32)(5 * ct->y / 32), 0, SZ_64K - 1);
-	}
-}
-
-/* ======================================================================== */
-/* Phase 3A — greedy distance-matching tracker                              */
-/* ======================================================================== */
-
-/*
- * Squared distance from a detection to a track's *predicted* position.
- * Prediction: next_pos = current_pos + velocity.
- */
-static inline s64 hx_dist2_predicted(const struct input_mt_pos *a,
-				       const struct hx_track *b)
-{
-	s32 pred_x = b->x + b->vx;
-	s32 pred_y = b->y + b->vy;
-	s32 dx = a->x - pred_x;
-	s32 dy = a->y - pred_y;
-
-	return (s64)dx * dx + (s64)dy * dy;
-}
-
-struct hx_match_candidate {
-	u8  track_idx;
-	u8  det_idx;
-	s64 dist2;
-};
-
-static void hx_reset_track(struct hx_track *trk)
-{
-	memset(trk, 0, sizeof(*trk));
-}
-
-void hx_track_contacts(struct hx_algo *algo,
-		       struct input_mt_pos *det, int det_cnt)
-{
-	bool det_used[HIMAX_MAX_TOUCH]     = { false };
-	bool track_matched[HIMAX_MAX_TOUCH] = { false };
-	u16  jump_released = 0;  /* bitmask: slots freed by jump detection */
-	struct hx_match_candidate cand[HIMAX_MAX_TOUCH * HIMAX_MAX_TOUCH];
-	int cand_cnt = 0;
-	int i, j, k;
-
-	/*
-	 * Build a candidate list of (track, detection) pairs within the
-	 * maximum allowed squared distance.
-	 */
-	for (i = 0; i < HIMAX_MAX_TOUCH; i++) {
-		struct hx_track *trk = &algo->tracks[i];
-
-		if (!trk->active)
-			continue;
-
-		for (j = 0; j < det_cnt; j++) {
-			s64 d2 = hx_dist2_predicted(&det[j], trk);
-
-			if (d2 > algo->track_dist2_max)
-				continue;
-
-			cand[cand_cnt].track_idx = i;
-			cand[cand_cnt].det_idx   = j;
-			cand[cand_cnt].dist2     = d2;
-			cand_cnt++;
-		}
-	}
-
-	/* Selection-sort candidates by distance (max 100 entries). */
-	for (i = 0; i < cand_cnt; i++) {
-		int best = i;
-
-		for (j = i + 1; j < cand_cnt; j++) {
-			if (cand[j].dist2 < cand[best].dist2 ||
-			    (cand[j].dist2 == cand[best].dist2 &&
-			     cand[j].track_idx < cand[best].track_idx) ||
-			    (cand[j].dist2 == cand[best].dist2 &&
-			     cand[j].track_idx == cand[best].track_idx &&
-			     cand[j].det_idx < cand[best].det_idx))
-				best = j;
-		}
-		if (best != i)
-			swap(cand[i], cand[best]);
-	}
-
-	/* Greedy assignment: take the shortest-distance uncontested pair. */
-	for (k = 0; k < cand_cnt; k++) {
-		struct hx_match_candidate *m = &cand[k];
-		struct hx_track *trk;
-
-		if (track_matched[m->track_idx] || det_used[m->det_idx])
-			continue;
-
-		trk = &algo->tracks[m->track_idx];
-		if (!trk->active)
-			continue;
-
-		/* Jump detection: if the actual (non-predicted) displacement
-		 * exceeds the jump threshold, this is a finger swap, not a
-		 * slide.  Release the old slot and let the detection spawn
-		 * a new track at a *different* slot so that lift + press
-		 * both appear in the same SYN_REPORT (zero added latency).
-		 */
-		if (algo->track_jump_dist2 > 0 && trk->age >= 2) {
-			s32 dx = det[m->det_idx].x - trk->x;
-			s32 dy = det[m->det_idx].y - trk->y;
-			s64 actual_d2 = (s64)dx * dx + (s64)dy * dy;
-
-			if (actual_d2 > algo->track_jump_dist2) {
-				hx_reset_track(trk);
-				jump_released |= (1u << m->track_idx);
-				track_matched[m->track_idx] = true;
-				/* det stays unused → picked up by new-slot logic */
-				continue;
-			}
-		}
-
-		/* Update position: smooth or direct. */
-		trk->vx = det[m->det_idx].x - trk->x;
-		trk->vy = det[m->det_idx].y - trk->y;
-		if (algo->track_smoothing) {
-			trk->x = (trk->x * 3 + det[m->det_idx].x) / 4;
-			trk->y = (trk->y * 3 + det[m->det_idx].y) / 4;
-		} else {
-			trk->x = det[m->det_idx].x;
-			trk->y = det[m->det_idx].y;
-		}
-		trk->missed = 0;
-		if (m->det_idx < algo->contact_count)
-			trk->signal_sum = algo->contacts[m->det_idx].signal_sum;
-		if (trk->age < U8_MAX)
-			trk->age++;
-		if (trk->debounce > 0)
-			trk->debounce--;
-
-		track_matched[m->track_idx] = true;
-		det_used[m->det_idx]        = true;
-	}
-
-	/* Age or release unmatched tracks. */
-	for (i = 0; i < HIMAX_MAX_TOUCH; i++) {
-		struct hx_track *trk = &algo->tracks[i];
-
-		if (!trk->active || track_matched[i])
-			continue;
-
-		/*
-		 * Before the first stable touch is established, drop stray
-		 * tracks immediately to prevent noise from being reported.
-		 */
-		if (algo->track_active_guard && !algo->touch_active) {
-			hx_reset_track(trk);
-			continue;
-		}
-
-		trk->missed++;
-		if (trk->missed > algo->track_lost_frames)
-			hx_reset_track(trk);
-	}
-
-	/* Create new slots for unmatched detections. */
-	for (j = 0; j < det_cnt; j++) {
-		struct hx_track *trk = NULL;
-
-		if (det_used[j])
-			continue;
-
-		for (i = 0; i < HIMAX_MAX_TOUCH; i++) {
-			if (!algo->tracks[i].active &&
-			    !(jump_released & (1u << i))) {
-				trk = &algo->tracks[i];
+	if (algo->safe_baseline_count < HX_SAFE_BASELINE_SLOTS) {
+		for (i = 0; i < HX_SAFE_BASELINE_SLOTS; i++)
+			if (!algo->safe_baselines[i].valid) {
+				slot = i;
 				break;
 			}
+		algo->safe_baseline_count++;
+	} else {
+		/* BaselineQueue_Push is chronological: a full queue replaces the
+		 * oldest unit, irrespective of confidence.
+		 */
+		slot = hx_safe_baseline_queue_oldest(algo);
+		if (slot >= HX_SAFE_BASELINE_SLOTS)
+			slot = algo->safe_baseline_selected;
+		algo->safe_queue_full_pushes = min_t(u8,
+			algo->safe_queue_full_pushes + 1, U8_MAX);
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->baseline_safe_eviction_count++;
+#endif
+	}
+	entry = &algo->safe_baselines[slot];
+	memcpy(entry->baseline_q8, baseline_q8, sizeof(entry->baseline_q8));
+	entry->valid = true;
+	/* A spatially new grid is provisional until another screen epoch sees
+	 * the same shape.  Selecting it immediately would turn one contaminated
+	 * runtime window into the next wake's recovery authority.
+	 */
+	entry->confidence = HX_SAFE_BASELINE_BOOTSTRAP;
+	entry->state = HX_SAFE_SLOT_PROVISIONAL;
+	entry->stable_frames = 1;
+	entry->reset_pending = false;
+	entry->pushed = false;
+	entry->generation = ++algo->safe_baseline_generation;
+	entry->screen_epoch = algo->screen_epoch;
+	entry->captured_frame = algo->frame_sequence;
+	hx_safe_baseline_queue_record(algo, slot);
+	algo->safe_baseline_pushes = min_t(u8,
+		algo->safe_baseline_pushes + 1, U8_MAX);
+	if (algo->safe_baseline_valid &&
+	    algo->safe_baseline_selected == slot &&
+	    algo->safe_baseline_count > 1) {
+		u8 best = HX_SAFE_BASELINE_SLOTS;
+
+		for (i = 0; i < HX_SAFE_BASELINE_SLOTS; i++) {
+			if (i == slot || !algo->safe_baselines[i].valid)
+				continue;
+			if (best == HX_SAFE_BASELINE_SLOTS ||
+			    algo->safe_baselines[i].confidence >
+				algo->safe_baselines[best].confidence ||
+			    (algo->safe_baselines[i].confidence ==
+				algo->safe_baselines[best].confidence &&
+			     algo->safe_baselines[i].generation >
+				algo->safe_baselines[best].generation))
+				best = i;
 		}
-		if (!trk)
-			continue;
-
-		trk->active   = true;
-		trk->age      = 1;
-		trk->missed   = 0;
-		trk->debounce = algo->debounce_base;
-		trk->x        = det[j].x;
-		trk->y        = det[j].y;
-		trk->vx       = 0;
-		trk->vy       = 0;
-		if (j < algo->contact_count)
-			trk->signal_sum = algo->contacts[j].signal_sum;
+		if (best < HX_SAFE_BASELINE_SLOTS)
+			hx_safe_baseline_select_slot(algo, best);
+	} else if (!algo->safe_baseline_valid ||
+		   algo->safe_baselines[algo->safe_baseline_selected].confidence <=
+			entry->confidence) {
+		hx_safe_baseline_select_slot(algo, slot);
 	}
 }
 
-int hx_count_stable_tracks(struct hx_algo *algo)
+void hx_algo_begin_wake(struct hx_algo *algo)
 {
-	int i, cnt = 0;
-
-	for (i = 0; i < HIMAX_MAX_TOUCH; i++) {
-		if (algo->tracks[i].active && algo->tracks[i].debounce == 0)
-			cnt++;
-	}
-	return cnt;
+	hx_algo_clear_transient_state(algo);
+	algo->screen_epoch++;
+	algo->screen_on_frame_sequence = algo->frame_sequence;
+	algo->safe_candidate_armed = true;
+	algo->safe_queue_full_pushes = 0;
+	algo->safe_prev_flags = algo->safe_flags;
+	algo->safe_flags = 0;
+	algo->wake_qualifying = true;
+	algo->wake_candidate_valid = false;
+	algo->wake_needs_double_confirm = false;
+	algo->wake_candidate_frames = 0;
+	algo->wake_finger_frames = 0;
+	algo->wake_finger_reject_frames = 0;
+	algo->wake_finger_common_sum = 0;
+	algo->wake_finger_common_last = 0;
+	algo->safe_no_finger_frames = 0;
+	algo->safe_candidate_confirming = false;
+	algo->safe_confirm_common_sum = 0;
+	algo->safe_confirm_common_last = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->live_clear_count++;
+#endif
 }
+
+static bool hx_wake_reference_common_shift(struct hx_algo *algo,
+					   const u16 *raw,
+					   const s32 *reference_q8,
+					   s32 *common_out)
+{
+	s64 common_sum = 0;
+	int common_bin;
+	int common_count = 0;
+	int cumulative = 0;
+	int i;
+
+	memset(algo->baseline_hist, 0, sizeof(algo->baseline_hist));
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 sample = (s32)le16_to_cpup(raw + i);
+		s32 baseline = reference_q8[i] >>
+			HX_BASELINE_FRACTION_BITS;
+		int bin = clamp_t(int, (sample - baseline + 65536) >> 6,
+				      0, HX_BASELINE_HIST_BINS - 1);
+
+		algo->baseline_hist[bin]++;
+	}
+	for (common_bin = 0; common_bin < HX_BASELINE_HIST_BINS;
+	     common_bin++) {
+		cumulative += algo->baseline_hist[common_bin];
+		if (cumulative >= (HX_PIXELS - 1) / 2)
+			break;
+	}
+	common_bin = min(common_bin, HX_BASELINE_HIST_BINS - 1);
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 sample = (s32)le16_to_cpup(raw + i);
+		s32 baseline = reference_q8[i] >>
+			HX_BASELINE_FRACTION_BITS;
+		s32 delta = sample - baseline;
+		int bin = clamp_t(int, (delta + 65536) >> 6, 0,
+				      HX_BASELINE_HIST_BINS - 1);
+
+		if (bin == common_bin) {
+			common_sum += delta;
+			common_count++;
+		}
+	}
+	if (!common_count)
+		return false;
+	*common_out = (s32)(common_sum / common_count);
+	return abs(*common_out) <= algo->cmf_max_correction;
+}
+
+static bool hx_wake_safe_common_shift(struct hx_algo *algo, const u16 *raw,
+				      s32 *common_out)
+{
+	return hx_wake_reference_common_shift(algo, raw,
+		algo->safe_baseline_q8, common_out);
+}
+
+void hx_safe_baseline_select_for_raw(struct hx_algo *algo, const u16 *raw)
+{
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	u8 old_selected = algo->safe_baseline_selected;
+#endif
+	u32 best_score = ~0U;
+	u8 best_confidence = HX_SAFE_BASELINE_EMPTY;
+	u8 best = HX_SAFE_BASELINE_SLOTS;
+	s32 threshold = max_t(s32, algo->wake_raw_jump_threshold * 2,
+				  algo->baseline_peak_threshold);
+	u8 slot;
+
+	for (slot = 0; slot < HX_SAFE_BASELINE_SLOTS; slot++) {
+		struct hx_safe_baseline_entry *entry =
+			&algo->safe_baselines[slot];
+		s32 common;
+		u32 score = 0;
+		int i;
+
+		if (!entry->valid || entry->reset_pending)
+			continue;
+		if (!hx_wake_reference_common_shift(algo, raw,
+			entry->baseline_q8, &common))
+			continue;
+		for (i = 1; i < HX_PIXELS; i++) {
+			s32 sample = (s32)le16_to_cpup(raw + i);
+			s32 baseline = entry->baseline_q8[i] >>
+				HX_BASELINE_FRACTION_BITS;
+			s32 local = sample - baseline - common;
+
+			if (abs(local) > threshold)
+				score++;
+		}
+		/* A candidate that needs a large spatial explanation is not a
+		 * usable wake reference.  In particular, do not let a stale
+		 * confirmed slot win merely because its confidence is higher than a
+		 * newer slot that actually matches this raw frame.  The Windows
+		 * SafeBaseline judge compares the current raw first; confidence is
+		 * only a tie breaker after the spatial fit has passed.
+		 */
+		if (score > algo->wake_max_unstable_nodes)
+			continue;
+		if (score < best_score ||
+		    (score == best_score &&
+		     (entry->confidence > best_confidence ||
+		      (entry->confidence == best_confidence &&
+		       (best == HX_SAFE_BASELINE_SLOTS ||
+			entry->generation > algo->safe_baselines[best].generation))))) {
+			best_confidence = entry->confidence;
+			best_score = score;
+			best = slot;
+		}
+	}
+	if (best < HX_SAFE_BASELINE_SLOTS) {
+		hx_safe_baseline_select_slot(algo, best);
+		algo->safe_baseline_selected_score = min_t(u32, best_score,
+							  U16_MAX);
+	}
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	else
+		algo->baseline_safe_slot_reject_count++;
+	if (best < HX_SAFE_BASELINE_SLOTS && old_selected != best)
+		algo->baseline_safe_slot_switch_count++;
+#endif
+}
+
+/*
+ * Validate a last-safe baseline while one or more fingers are already on the
+ * panel.  A compact positive residual is masked (including its low-amplitude
+ * fringe), then only the remaining background participates in line-noise and
+ * common-shift checks.  This is the minimum useful subset of the Windows
+ * BLIIR/BLSM behaviour: touch cells never become baseline input, while a
+ * panel-wide display/VCOM shift can still be applied to the working copy.
+ */
+static bool hx_wake_finger_background_quality(struct hx_algo *algo,
+					      const u16 *raw,
+					      s32 *common_out)
+{
+	u8 row_unstable[HX_ROWS] = { 0 };
+	u8 col_unstable[HX_COLS] = { 0 };
+	s32 common;
+	s32 background_threshold;
+	u16 touch_cells = 0;
+	u16 unstable = 0;
+	u8 components = 0;
+	int r, c, i;
+
+	memset(algo->zone_map, 0, sizeof(algo->zone_map));
+	if (!hx_wake_safe_common_shift(algo, raw, &common))
+		return false;
+
+	/* First mark strong touch cells, then dilate without recursively growing
+	 * the mask.  Value 1 is a seed and value 2 is its protected fringe.
+	 */
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 sample = (s32)le16_to_cpup(raw + i);
+		s32 baseline = algo->safe_baseline_q8[i] >>
+				HX_BASELINE_FRACTION_BITS;
+
+		if (sample - baseline - common >=
+		    algo->baseline_peak_threshold) {
+			algo->zone_map[i] = 1;
+			row_unstable[i / HX_COLS]++;
+			col_unstable[i % HX_COLS]++;
+			touch_cells++;
+		}
+	}
+	if (!touch_cells || touch_cells > HIMAX_WAKE_MAX_TOUCH_CELLS)
+		return false;
+	for (r = 0; r < HX_ROWS; r++)
+		if (row_unstable[r] >= algo->wake_max_unstable_line_nodes)
+			return false;
+	for (c = 0; c < HX_COLS; c++)
+		if (col_unstable[c] >= algo->wake_max_unstable_line_nodes)
+			return false;
+	/* The firmware finger bit is useful evidence, but it must not turn
+	 * scattered or diagonal display noise into an unlimited exclusion mask.
+	 * Require at most one compact connected seed region per reportable slot.
+	 */
+	for (i = 1; i < HX_PIXELS; i++) {
+		u16 head = 0;
+		u16 tail = 0;
+		int min_r, max_r, min_c, max_c;
+
+		if (algo->zone_map[i] != 1)
+			continue;
+		if (++components > HIMAX_MAX_TOUCH)
+			return false;
+		min_r = max_r = i / HX_COLS;
+		min_c = max_c = i % HX_COLS;
+		algo->zone_map[i] = 3;
+		algo->bfs_queue[tail++] = i;
+		while (head < tail) {
+			int idx = algo->bfs_queue[head++];
+			int cr = idx / HX_COLS;
+			int cc = idx % HX_COLS;
+
+			min_r = min(min_r, cr);
+			max_r = max(max_r, cr);
+			min_c = min(min_c, cc);
+			max_c = max(max_c, cc);
+			for (int dr = -1; dr <= 1; dr++) {
+				int nr = cr + dr;
+
+				if (nr < 0 || nr >= HX_ROWS)
+					continue;
+				for (int dc = -1; dc <= 1; dc++) {
+					int nc = cc + dc;
+					int next;
+
+					if ((!dr && !dc) || nc < 0 ||
+					    nc >= HX_COLS)
+						continue;
+					next = nr * HX_COLS + nc;
+					if (algo->zone_map[next] != 1)
+						continue;
+					algo->zone_map[next] = 3;
+					algo->bfs_queue[tail++] = next;
+				}
+			}
+		}
+		if (max_r - min_r + 1 > algo->wake_max_unstable_line_nodes ||
+		    max_c - min_c + 1 > algo->wake_max_unstable_line_nodes)
+			return false;
+	}
+	memset(row_unstable, 0, sizeof(row_unstable));
+	memset(col_unstable, 0, sizeof(col_unstable));
+	for (i = 1; i < HX_PIXELS; i++) {
+		if (algo->zone_map[i] != 3)
+			continue;
+		r = i / HX_COLS;
+		c = i % HX_COLS;
+		for (int dr = -HIMAX_WAKE_TOUCH_MASK_RADIUS;
+		     dr <= HIMAX_WAKE_TOUCH_MASK_RADIUS; dr++) {
+			int nr = r + dr;
+
+			if (nr < 0 || nr >= HX_ROWS)
+				continue;
+			for (int dc = -HIMAX_WAKE_TOUCH_MASK_RADIUS;
+			     dc <= HIMAX_WAKE_TOUCH_MASK_RADIUS; dc++) {
+				int nc = c + dc;
+				int idx;
+
+				if (nc < 0 || nc >= HX_COLS)
+					continue;
+				idx = nr * HX_COLS + nc;
+				if (!algo->zone_map[idx])
+					algo->zone_map[idx] = 2;
+			}
+		}
+	}
+
+	background_threshold = max_t(s32, algo->wake_raw_jump_threshold * 2,
+					 algo->baseline_peak_threshold);
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 sample;
+		s32 baseline;
+		s32 local;
+
+		if (algo->zone_map[i])
+			continue;
+		sample = (s32)le16_to_cpup(raw + i);
+		baseline = algo->safe_baseline_q8[i] >>
+			   HX_BASELINE_FRACTION_BITS;
+		local = sample - baseline - common;
+		if (abs(local) <= background_threshold)
+			continue;
+		row_unstable[i / HX_COLS]++;
+		col_unstable[i % HX_COLS]++;
+		unstable++;
+	}
+	if (unstable > algo->wake_max_unstable_nodes)
+		return false;
+	for (r = 0; r < HX_ROWS; r++)
+		if (row_unstable[r] >= algo->wake_max_unstable_line_nodes)
+			return false;
+	for (c = 0; c < HX_COLS; c++)
+		if (col_unstable[c] >= algo->wake_max_unstable_line_nodes)
+			return false;
+
+	*common_out = common;
+	return true;
+}
+
+enum hx_wake_safe_observation {
+	HX_WAKE_SAFE_CLEAN,
+	HX_WAKE_SAFE_FINGER,
+	HX_WAKE_SAFE_AMBIGUOUS,
+};
+
+/* Windows does not decide held-in-hand recovery from one firmware flag.  It
+ * compares raw, working BL and the last independently safe BL, protects
+ * touch-shaped residuals and rejects an untrustworthy replacement.  Keep the
+ * same ordering here: first recognize a compact touch, then accept a clean
+ * common-shift-only frame; everything else is ambiguous and may not become a
+ * wake baseline.
+ */
+static enum hx_wake_safe_observation
+hx_wake_observe_against_safe(struct hx_algo *algo, const u16 *raw,
+			     s32 *common_out, bool *common_valid)
+{
+	u8 row_bad[HX_ROWS] = { 0 };
+	u8 col_bad[HX_COLS] = { 0 };
+	s32 common;
+	s32 threshold = algo->baseline_peak_threshold;
+	u16 bad = 0;
+	int r, c, i;
+
+	*common_valid = false;
+	if (hx_wake_finger_background_quality(algo, raw, &common)) {
+		*common_out = common;
+		*common_valid = true;
+		return HX_WAKE_SAFE_FINGER;
+	}
+	if (!hx_wake_safe_common_shift(algo, raw, &common))
+		return HX_WAKE_SAFE_AMBIGUOUS;
+	*common_out = common;
+	*common_valid = true;
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 sample = (s32)le16_to_cpup(raw + i);
+		s32 baseline = algo->safe_baseline_q8[i] >>
+			HX_BASELINE_FRACTION_BITS;
+		s32 local = sample - baseline - common;
+
+		if (abs(local) <= threshold)
+			continue;
+		r = i / HX_COLS;
+		c = i % HX_COLS;
+		row_bad[r]++;
+		col_bad[c]++;
+		bad++;
+	}
+	for (r = 0; r < HX_ROWS; r++)
+		if (row_bad[r] >= algo->wake_max_unstable_line_nodes)
+			return HX_WAKE_SAFE_AMBIGUOUS;
+	for (c = 0; c < HX_COLS; c++)
+		if (col_bad[c] >= algo->wake_max_unstable_line_nodes)
+			return HX_WAKE_SAFE_AMBIGUOUS;
+	/* Official SafeBaseline checks both abnormal maxima and minima before
+	 * accepting a screen-on baseline.  A large thumb can depress a compact
+	 * group of cells instead of producing the usual positive peak; allowing a
+	 * small number of such cells as "clean" learns the held contact into the
+	 * working baseline.  Temporal confirmation already filters one-frame
+	 * noise, so any persistent spatial residual is protected here.
+	 */
+	if (bad)
+		return HX_WAKE_SAFE_AMBIGUOUS;
+	*common_out = common;
+	return HX_WAKE_SAFE_CLEAN;
+}
+
+int hx_algo_qualify_wake_frame(struct hx_algo *algo, const u16 *raw,
+			       enum hx_finger_state finger_state)
+{
+	enum hx_wake_safe_observation safe_observation = HX_WAKE_SAFE_CLEAN;
+	u8 row_unstable[HX_ROWS] = { 0 };
+	u8 col_unstable[HX_COLS] = { 0 };
+	s32 observed_common = 0;
+	bool observed_common_valid = false;
+	u16 out_of_range = 0;
+	u16 unstable = 0;
+	u8 required_frames;
+	bool had_safe_baseline = algo->safe_baseline_valid;
+	int i;
+
+	if (!algo->wake_qualifying)
+		return HX_WAKE_QUALITY_READY;
+	for (i = 1; i < HX_PIXELS; i++) {
+		u16 sample = le16_to_cpup(raw + i);
+
+		if (sample < 0x1000 || sample > 0xf000)
+			out_of_range++;
+	}
+	if (out_of_range > algo->wake_max_unstable_nodes) {
+		algo->wake_candidate_valid = false;
+		algo->wake_candidate_frames = 0;
+		algo->wake_needs_double_confirm = false;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->wake_candidate_reject_count++;
+#endif
+		return HX_WAKE_QUALITY_REJECTED;
+	}
+	if (algo->safe_baseline_count)
+		hx_safe_baseline_select_for_raw(algo, raw);
+	if (algo->safe_baseline_valid)
+		safe_observation = hx_wake_observe_against_safe(algo, raw,
+							       &observed_common,
+							       &observed_common_valid);
+
+	/* A finger already present at screen-on must never be learned into a new
+	 * baseline.  Firmware may miss a stationary finger during reset/reload,
+	 * so a compact raw residual against last-safe is equally authoritative.
+	 * Validate the background outside a dilated touch mask and apply only its
+	 * stable common shift to the working last-safe snapshot.
+	 */
+	if (finger_state == HX_FINGER_PRESENT ||
+	    safe_observation == HX_WAKE_SAFE_FINGER) {
+		s32 common = 0;
+		bool inferred = finger_state != HX_FINGER_PRESENT;
+
+		algo->wake_candidate_valid = false;
+		algo->wake_candidate_frames = 0;
+		algo->wake_needs_double_confirm = false;
+		if (algo->safe_baseline_valid) {
+			s32 average;
+
+			common = observed_common;
+			if (safe_observation != HX_WAKE_SAFE_FINGER ||
+			    (algo->wake_finger_frames &&
+			     abs(common - algo->wake_finger_common_last) >
+				algo->wake_raw_jump_threshold)) {
+				algo->wake_finger_frames = 0;
+				algo->wake_finger_common_sum = 0;
+				algo->wake_finger_common_last = 0;
+				if (algo->wake_finger_reject_frames < U8_MAX)
+					algo->wake_finger_reject_frames++;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+				algo->wake_finger_mask_reject_count++;
+#endif
+				/*
+				 * The strict mask decides whether a common-mode
+				 * correction is trustworthy; it must not decide whether
+				 * touch IRQs are enabled.  Real fingers, palms and edge
+				 * contacts need not match the compact synthetic shape.
+				 * After several electrically valid finger frames, restore
+				 * the independently trusted safe grid without learning the
+				 * contact or applying an untrusted correction.
+				 */
+				if (algo->wake_finger_reject_frames <
+				    algo->wake_finger_safe_frames)
+					return HX_WAKE_QUALITY_PENDING;
+				hx_restore_working_from_safe(algo, 0, true, true);
+				algo->wake_qualifying = false;
+				algo->wake_raw_finger_override = inferred;
+				algo->wake_raw_finger_release_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+				algo->wake_safe_fallback_count++;
+				algo->wake_finger_degraded_fallback_count++;
+				algo->wake_qualification_count++;
+#endif
+				return HX_WAKE_QUALITY_USING_SAFE;
+			}
+			algo->wake_finger_reject_frames = 0;
+			algo->wake_finger_common_sum += common;
+			algo->wake_finger_common_last = common;
+			if (algo->wake_finger_frames < U8_MAX)
+				algo->wake_finger_frames++;
+			if (algo->wake_finger_frames <
+			    algo->wake_finger_safe_frames)
+				return HX_WAKE_QUALITY_PENDING;
+
+			average = algo->wake_finger_common_sum /
+				  algo->wake_finger_frames;
+		/* The vendor held-in-hand path reconstructs BL from the latest
+		 * safe snapshot and BL2BL difference buffers.  On first boot there
+		 * is no working BL history yet, so use the safe grid plus CM shift.
+		 */
+		if (algo->baseline_initialized) {
+			hx_safe_baseline_buffer_comparison(algo, raw);
+			if (hx_safe_baseline_should_replace_wake(algo))
+				hx_safe_baseline_replace_working_from_history(algo, average);
+			else
+				hx_restore_working_from_safe(algo, average, true, true);
+		} else {
+			hx_restore_working_from_safe(algo, average, true, true);
+		}
+			algo->baseline_touch_hold = true;
+			algo->baseline_touch_seen = true;
+			algo->baseline_held_in_hand = true;
+			algo->baseline_guard_state = HX_BASELINE_GUARD_PROTECTED;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+			algo->wake_finger_mask_accept_count++;
+#endif
+		} else {
+			algo->wake_finger_reject_frames = 0;
+			if (algo->wake_finger_frames < U8_MAX)
+				algo->wake_finger_frames++;
+			if (algo->wake_finger_frames <
+			    algo->wake_finger_safe_frames)
+				return HX_WAKE_QUALITY_PENDING;
+			if (!algo->baseline_initialized) {
+				for (i = 0; i < HX_PIXELS; i++)
+					algo->baseline_q8[i] =
+						(s32)algo->baseline_initial <<
+						HX_BASELINE_FRACTION_BITS;
+			}
+			algo->baseline_touch_hold = true;
+			algo->baseline_touch_seen = true;
+			algo->baseline_touch_release_frames = 0;
+			algo->baseline_guard_state = HX_BASELINE_GUARD_PROTECTED;
+			algo->baseline_guard_clean_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+			algo->baseline_touch_hold_count++;
+#endif
+		}
+		algo->baseline_initialized = true;
+		algo->wake_qualifying = false;
+		algo->wake_raw_finger_override = inferred;
+		algo->wake_raw_finger_release_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->wake_safe_fallback_count++;
+		algo->wake_qualification_count++;
+		if (inferred)
+			algo->wake_raw_finger_inferred_count++;
+#endif
+		return algo->safe_baseline_valid ?
+			HX_WAKE_QUALITY_USING_SAFE :
+			HX_WAKE_QUALITY_PROTECTED;
+	}
+	/* A stable but non-clean shape against last-safe is neither permission to
+	 * overwrite safe BL nor a reason to power the input device down.  Match
+	 * the official protection bias: rebuild working from trusted history,
+	 * treat the raw state as held-in-hand until a clean release is confirmed,
+	 * and let runtime diagnostics decide whether BLReset would help.
+	 */
+	if (algo->safe_baseline_valid &&
+	    safe_observation == HX_WAKE_SAFE_AMBIGUOUS) {
+		algo->wake_candidate_valid = false;
+		algo->wake_candidate_frames = 0;
+		algo->wake_needs_double_confirm = false;
+		algo->wake_finger_frames = 0;
+		algo->wake_finger_common_sum = 0;
+		algo->wake_finger_common_last = 0;
+		if (algo->wake_finger_reject_frames < U8_MAX)
+			algo->wake_finger_reject_frames++;
+		if (algo->wake_finger_reject_frames <
+		    algo->wake_finger_safe_frames)
+			return HX_WAKE_QUALITY_PENDING;
+		hx_restore_working_from_safe(algo,
+			observed_common_valid ? observed_common : 0, true, true);
+		algo->wake_qualifying = false;
+		algo->wake_raw_finger_override = true;
+		algo->wake_raw_finger_release_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->wake_safe_fallback_count++;
+		algo->wake_ambiguous_safe_fallback_count++;
+		algo->wake_qualification_count++;
+#endif
+		return HX_WAKE_QUALITY_USING_SAFE;
+	}
+	algo->wake_finger_frames = 0;
+	algo->wake_finger_reject_frames = 0;
+	algo->wake_finger_common_sum = 0;
+	algo->wake_finger_common_last = 0;
+
+	if (!algo->wake_candidate_valid) {
+		hx_copy_raw_to_baseline(algo->wake_candidate_q8, raw);
+		algo->wake_candidate_valid = true;
+		algo->wake_candidate_frames = 1;
+		return HX_WAKE_QUALITY_PENDING;
+	}
+
+	/* A candidate is only committed after several complete raw grids agree.
+	 * Count spatially-local changes; a panel-wide DC shift is naturally
+	 * represented by the first candidate and is not confused with activity.
+	 */
+	for (i = 1; i < HX_PIXELS; i++) {
+		s32 sample_q8 = (s32)le16_to_cpup(raw + i) <<
+				HX_BASELINE_FRACTION_BITS;
+		s32 delta = (sample_q8 - algo->wake_candidate_q8[i]) >>
+			    HX_BASELINE_FRACTION_BITS;
+
+		if (abs(delta) > algo->wake_raw_jump_threshold) {
+			row_unstable[i / HX_COLS]++;
+			col_unstable[i % HX_COLS]++;
+			unstable++;
+		}
+	}
+	for (i = 0; i < HX_ROWS; i++)
+		if (row_unstable[i] >= algo->wake_max_unstable_line_nodes)
+			unstable = algo->wake_max_unstable_nodes + 1;
+	for (i = 0; i < HX_COLS; i++)
+		if (col_unstable[i] >= algo->wake_max_unstable_line_nodes)
+			unstable = algo->wake_max_unstable_nodes + 1;
+	if (unstable > algo->wake_max_unstable_nodes) {
+		/* Start the next qualification window from the newest complete frame.
+		 * Do not poison either the working or last-safe baseline.
+		 */
+		hx_copy_raw_to_baseline(algo->wake_candidate_q8, raw);
+		algo->wake_candidate_frames = 1;
+		algo->wake_needs_double_confirm = false;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->wake_candidate_reject_count++;
+#endif
+		return HX_WAKE_QUALITY_REJECTED;
+	}
+
+	if (algo->wake_candidate_frames < U8_MAX)
+		algo->wake_candidate_frames++;
+	if (algo->wake_candidate_frames < algo->wake_stable_frames)
+		return HX_WAKE_QUALITY_PENDING;
+
+	/* A candidate that differs spatially from last-safe is not rejected just
+	 * because the display environment genuinely changed.  It must, however,
+	 * survive a second complete stability window before becoming the working
+	 * baseline.  Existing safe data remains a separate recovery authority.
+	 */
+	if (algo->safe_baseline_valid && !algo->wake_needs_double_confirm) {
+		s64 sum = 0;
+		s32 common;
+		u16 divergent = 0;
+
+		for (i = 1; i < HX_PIXELS; i++)
+			sum += (algo->wake_candidate_q8[i] -
+				algo->safe_baseline_q8[i]) >>
+				HX_BASELINE_FRACTION_BITS;
+		common = (s32)(sum / (HX_PIXELS - 1));
+		for (i = 1; i < HX_PIXELS; i++) {
+			s32 delta = ((algo->wake_candidate_q8[i] -
+				algo->safe_baseline_q8[i]) >>
+				HX_BASELINE_FRACTION_BITS) - common;
+
+			if (abs(delta) > algo->wake_raw_jump_threshold * 2)
+				divergent++;
+		}
+		if (divergent > algo->wake_max_unstable_nodes) {
+			algo->wake_needs_double_confirm = true;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+			algo->wake_safe_divergence_count++;
+#endif
+		}
+	}
+	required_frames = algo->wake_stable_frames;
+	if (algo->wake_needs_double_confirm)
+		required_frames = min_t(u8, algo->wake_stable_frames * 2,
+					 U8_MAX);
+	if (algo->wake_candidate_frames < required_frames)
+		return HX_WAKE_QUALITY_PENDING;
+
+	/* A confirmed history has already survived an independent no-touch
+	 * window.  A wake frame only proves that scanning resumed; it must not
+	 * replace the spatial grid with display-startup residue.  Apply the
+	 * verified panel-wide shift now and leave promotion of the new raw grid to
+	 * the normal post-wake double-window SafeBaseline collector.
+	 */
+	/* BOOTSTRAP is not trusted for an autonomous runtime BLReset, but it is
+	 * still strictly safer than copying an unclassified screen-on raw grid.
+	 * Wake protection keeps it read-only, applies only a robust common shift,
+	 * and requires the post-wake guard before spatial learning resumes.
+	 */
+	if (had_safe_baseline) {
+		hx_restore_working_from_safe(algo,
+			observed_common_valid ? observed_common : 0, true, false);
+		algo->wake_qualifying = false;
+		algo->wake_candidate_valid = false;
+		algo->wake_needs_double_confirm = false;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+		algo->baseline_generation++;
+		algo->wake_qualification_count++;
+		algo->wake_safe_preserved_count++;
+		algo->wake_clean_safe_restore_count++;
+#endif
+		return HX_WAKE_QUALITY_USING_SAFE;
+	}
+
+	if (algo->baseline_enabled)
+		memcpy(algo->baseline_q8, algo->wake_candidate_q8,
+		       sizeof(algo->baseline_q8));
+	if (!had_safe_baseline)
+		hx_safe_baseline_bootstrap(algo, algo->wake_candidate_q8);
+	algo->baseline_initialized = true;
+	algo->wake_qualifying = false;
+	algo->wake_candidate_valid = false;
+	algo->wake_needs_double_confirm = false;
+	algo->baseline_prev_had_signal = false;
+	algo->baseline_had_freeze = false;
+	algo->baseline_recovery_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->baseline_generation++;
+	algo->wake_baseline_commit_count++;
+	algo->wake_qualification_count++;
+	if (had_safe_baseline)
+		algo->wake_safe_preserved_count++;
+#endif
+	return HX_WAKE_QUALITY_READY;
+}
+
+enum hx_finger_state
+hx_algo_resolve_finger_state(struct hx_algo *algo, const u16 *raw,
+			     enum hx_finger_state firmware_state)
+{
+	enum hx_wake_safe_observation observation;
+	s32 common;
+	bool common_valid;
+
+	if (firmware_state == HX_FINGER_PRESENT) {
+		algo->wake_raw_finger_release_frames = 0;
+		return HX_FINGER_PRESENT;
+	}
+	if (!algo->wake_raw_finger_override)
+		return firmware_state;
+	if (!algo->safe_baseline_valid) {
+		algo->wake_raw_finger_override = false;
+		algo->wake_raw_finger_release_frames = 0;
+		return firmware_state;
+	}
+
+	observation = hx_wake_observe_against_safe(algo, raw, &common,
+						     &common_valid);
+	if (observation != HX_WAKE_SAFE_CLEAN) {
+		algo->wake_raw_finger_release_frames = 0;
+		return HX_FINGER_PRESENT;
+	}
+	if (algo->wake_raw_finger_release_frames < U8_MAX)
+		algo->wake_raw_finger_release_frames++;
+	if (algo->wake_raw_finger_release_frames <
+	    algo->wake_finger_safe_frames)
+		return HX_FINGER_PRESENT;
+
+	algo->wake_raw_finger_override = false;
+	algo->wake_raw_finger_release_frames = 0;
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->wake_raw_finger_release_count++;
+#endif
+	return HX_FINGER_ABSENT;
+}
+
+bool hx_algo_is_exception_frame(struct hx_algo *algo, const u16 *raw)
+{
+	u8 col_bad[HX_COLS] = { 0 };
+	s64 sum = 0;
+	s32 common;
+	u16 total = 0;
+	int r, c;
+
+	if (!algo->baseline_initialized || algo->wake_qualifying)
+		return false;
+	for (r = 1; r < HX_PIXELS; r++)
+		sum += (s32)le16_to_cpup(raw + r) -
+		       (algo->baseline_q8[r] >> HX_BASELINE_FRACTION_BITS);
+	common = (s32)(sum / (HX_PIXELS - 1));
+
+	for (r = 0; r < HX_ROWS; r++) {
+		u8 row_bad = 0;
+
+		for (c = 0; c < HX_COLS; c++) {
+			int idx = r * HX_COLS + c;
+			s32 local;
+
+			if (!idx)
+				continue;
+			local = (s32)le16_to_cpup(raw + idx) -
+				(algo->baseline_q8[idx] >>
+				 HX_BASELINE_FRACTION_BITS) - common;
+			if (abs(local) >= algo->runtime_noise_threshold) {
+				row_bad++;
+				col_bad[c]++;
+				total++;
+			}
+		}
+		if (row_bad >= algo->runtime_noise_line_nodes)
+			goto exception;
+	}
+	for (c = 0; c < HX_COLS; c++)
+		if (col_bad[c] >= algo->runtime_noise_line_nodes)
+			goto exception;
+	if (total < algo->runtime_noise_total_nodes)
+		return false;
+
+exception:
+#ifdef CONFIG_TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	algo->noise_frame_hold_count++;
+#endif
+	return true;
+}
+
+#ifdef HX_ALGO_HOST_TEST
+void hx_algo_reset_runtime(struct hx_algo *algo)
+{
+	hx_algo_clear_live_state(algo);
+}
+#endif
+
+/* ======================================================================== */
+/* Phase 1A — baseline subtraction                                          */
+/* ======================================================================== */

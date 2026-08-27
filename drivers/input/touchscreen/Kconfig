@@ -1430,4 +1430,16 @@ config TOUCHSCREEN_HIMAX_HX83121A_SPI
 
 	  To compile this driver as a module, choose M here: the
 	  module will be called himax_hx83121a_spi.
+
+config TOUCHSCREEN_HIMAX_HX83121A_DIAGNOSTICS
+	bool "Himax HX83121A full-rate diagnostic capture"
+	depends on TOUCHSCREEN_HIMAX_HX83121A_SPI
+	help
+	  Build the full-rate event trace and read-only diagnostic sysfs
+	  snapshots used to investigate intermittent touch dropouts. This adds
+	  per-interrupt matrix/event-stack copies and about 10.3 MiB of trace
+	  storage per device.
+
+	  Leave this disabled for normal use. Enable it only in kernels intended
+	  for capture with the Himax diagnostic app.
 endif

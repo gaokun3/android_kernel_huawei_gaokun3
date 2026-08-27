@@ -120,4 +120,13 @@ obj-$(CONFIG_TOUCHSCREEN_IQS7211)	+= iqs7211.o
 obj-$(CONFIG_TOUCHSCREEN_ZINITIX)	+= zinitix.o
 obj-$(CONFIG_TOUCHSCREEN_HIMAX_HX83112B)	+= himax_hx83112b.o
 obj-$(CONFIG_TOUCHSCREEN_HIMAX_HX83121A_SPI)	+= himax_hx83121a_spi.o
-himax_hx83121a_spi-y			:= himax-spi-core.o hx-algo.o
+himax_hx83121a_spi-y			:= himax-spi-core.o himax-spi-hw.o himax-spi-sysfs.o \
+				   hx-algo.o hx-algo-preprocess.o hx-algo-detect.o \
+				   hx-algo-resolve.o hx-algo-track.o \
+				   hx-baseline-state.o hx-baseline-property.o \
+				   hx-baseline-observe.o hx-baseline-update.o \
+				   hx-blreset.o hx-blreset-abnormal.o hx-blreset-state.o \
+				   hx-blrecal.o hx-blsm-shb.o hx-safe-baseline.o \
+				   hx-safe-baseline-signal.o hx-safe-baseline-stats.o \
+				   hx-safe-baseline-judge.o hx-safe-baseline-queue.o \
+				   hx-panel-profile.o
