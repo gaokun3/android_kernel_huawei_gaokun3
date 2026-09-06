@@ -7013,7 +7013,7 @@
 
 			trips {
 				cpu0_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7043,7 +7043,7 @@
 
 			trips {
 				cpu1_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7073,7 +7073,7 @@
 
 			trips {
 				cpu2_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7103,7 +7103,7 @@
 
 			trips {
 				cpu3_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7133,7 +7133,7 @@
 
 			trips {
 				cpu4_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7163,7 +7163,7 @@
 
 			trips {
 				cpu5_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7193,7 +7193,7 @@
 
 			trips {
 				cpu6_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};
@@ -7223,7 +7223,7 @@
 
 			trips {
 				cpu7_alert0: trip-point0 {
-					temperature = <85000>;
+					temperature = <75000>;
 					hysteresis = <2000>;
 					type = "passive";
 				};

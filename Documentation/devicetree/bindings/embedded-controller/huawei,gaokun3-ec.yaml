@@ -31,6 +31,9 @@ properties:
   '#size-cells':
     const: 0
 
+  '#thermal-sensor-cells':
+    const: 1
+
   interrupts:
     maxItems: 1
 
@@ -64,6 +67,7 @@ examples:
 
             #address-cells = <1>;
             #size-cells = <0>;
+            #thermal-sensor-cells = <1>;
 
             connector@0 {
                 compatible = "usb-c-connector";
