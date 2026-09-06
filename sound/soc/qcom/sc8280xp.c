@@ -39,12 +39,31 @@ static int sc8280xp_snd_init(struct snd_soc_pcm_runtime *rtd)
 	case WSA_CODEC_DMA_RX_0:
 	case WSA_CODEC_DMA_RX_1:
 		/*
-		 * Set limit of -3 dB on Digital Volume and 0 dB on PA Volume
-		 * to reduce the risk of speaker damage until we have active
-		 * speaker protection in place.
+		 * Upstream limits this to -3 dB "to reduce the risk of
+		 * speaker damage until we have active speaker protection
+		 * in place". On the Huawei MateBook E Go that margin makes
+		 * the speakers too quiet to be usable, and measurement
+		 * shows this control is the only working gain in the
+		 * speaker path: stepping it 81 -> 61 -> 41 moves the
+		 * acoustic output -17.1 dB and -26.9 dB, while PA Volume,
+		 * the BOOST port switch and the compander switch change
+		 * nothing at all.
+		 *
+		 * Raise the ceiling to +6 dB. The control scale is
+		 * value - 84 dB, so 90 is +6 dB and the stock 81 is the
+		 * -3 dB the comment above refers to.
+		 *
+		 * This trades away part of a deliberate safety margin, so
+		 * it is a local change and not something to send upstream.
+		 * The device-specific justification: these are the small
+		 * speakers of a fanless 12.35" tablet, the compander and
+		 * VISENSE feedback are both enabled, and the factory
+		 * calibration this SoC would normally use died with the
+		 * Windows install, so upstream cannot assume protection
+		 * either way.
 		 */
-		snd_soc_limit_volume(card, "WSA_RX0 Digital Volume", 81);
-		snd_soc_limit_volume(card, "WSA_RX1 Digital Volume", 81);
+		snd_soc_limit_volume(card, "WSA_RX0 Digital Volume", 90);
+		snd_soc_limit_volume(card, "WSA_RX1 Digital Volume", 90);
 		snd_soc_limit_volume(card, "SpkrLeft PA Volume", 17);
 		snd_soc_limit_volume(card, "SpkrRight PA Volume", 17);
 		break;
