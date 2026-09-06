@@ -1287,7 +1287,13 @@
 };
 
 &usb_0_dwc3 {
-	dr_mode = "host";
+	/* port0（空闲口）。port1 (a800000) 挂启动介质，必须保持 host。 */
+	dr_mode = "otg";
+	usb-role-switch;
+	/* 限 USB2：k11 起 DP 驱动激活，QMP combo PHY 的 USB3 pipe 时钟
+	 * 被 DP 抢走（UCSI 不工作没人管 mux），dwc3 软复位超时 -110。
+	 * high-speed 让 dwc3 跳过 USB3 PHY。SuperSpeed 本来就需要 UCSI。 */
+	maximum-speed = "high-speed";
 };
 
 &usb_0_dwc3_hs {
@@ -1416,6 +1422,11 @@
 
 	qcom,dmic-sample-rate = <4800000>;
 
+	status = "okay";
+};
+
+&venus {
+	firmware-name = "qcom/sc8280xp/HUAWEI/gaokun3/qcvss8280.mbn";
 	status = "okay";
 };
 
@@ -1658,6 +1669,12 @@
 	};
 
 	ts0_default: ts0-default-state {
+		mode-pins {
+			pins = "gpio174";
+			function = "gpio";
+			output-low;
+		};
+
 		int-n-pins {
 			pins = "gpio175";
 			function = "gpio";
